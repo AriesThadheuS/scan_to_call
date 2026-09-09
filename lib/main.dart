@@ -349,7 +349,7 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
                   child: Row(
                     children: [
                       Icon(
-                        Icons.phone_active_rounded,
+                        Icons.phone_in_talk_rounded,
                         color: colorScheme.onPrimaryContainer,
                         size: 28,
                       ),
