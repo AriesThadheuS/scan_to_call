@@ -1,5 +1,5 @@
 name: phone_number_scanner
-description: "A Flutter application that extracts phone numbers from images using Google ML Kit and opens native dialer."
+description: "A Flutter application that extracts phone numbers from images using Google ML Kit and saves them to Cloud Firestore."
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -12,6 +12,8 @@ dependencies:
   image_picker: ^1.1.2
   google_mlkit_text_recognition: ^0.14.0
   url_launcher: ^6.3.0
+  firebase_core: ^3.6.0
+  cloud_firestore: ^5.4.4
   cupertino_icons: ^1.0.8
 
 dev_dependencies:

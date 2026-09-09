@@ -3,8 +3,20 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
-void main() {
+import 'firebase_options.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+  } catch (e) {
+    debugPrint("Firebase initialization info: $e");
+  }
   runApp(const PhoneExtractorApp());
 }
 
@@ -14,7 +26,7 @@ class PhoneExtractorApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Phone Extractor',
+      title: 'Phone Scanner AI',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -58,11 +70,9 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
     super.dispose();
   }
 
-  /// Smart Regex to prioritize phone numbers, ignore surrounding alphabetic text,
-  /// and return STRICTLY the FIRST valid phone number found.
+  /// Smart Regex to extract phone numbers while completely ignoring surrounding alphabetic text.
+  /// Strictly returns ONLY the FIRST valid phone number match (7 to 15 digits).
   String? _extractPhoneNumber(String text) {
-    // Lookbehind & Lookahead negative assertions prevent matching alphanumeric codes (e.g. USER123456789).
-    // Matches: +1 (800) 555-0199, +91 98765 43210, 080-23456789, +44.20.7946.0958, etc.
     final RegExp phoneRegex = RegExp(
       r'(?<![a-zA-Z0-9])(?:(?:\+|00)\d{1,4}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}(?![a-zA-Z0-9])',
     );
@@ -72,13 +82,13 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
     for (final match in matches) {
       final rawMatch = match.group(0);
       if (rawMatch != null) {
-        // Completely strip any leftover letters/symbols, preserving '+' prefix if present
+        // Strip non-digit and non-plus characters
         final cleanNumber = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
         final digitCount = cleanNumber.replaceAll(RegExp(r'[^\d]'), '').length;
 
-        // Valid phone numbers according to E.164 recommendation (7 to 15 digits)
+        // Valid phone number length according to ITU E.164 (7 to 15 digits)
         if (digitCount >= 7 && digitCount <= 15) {
-          // STRICT REQUIREMENT: Return immediately upon finding the FIRST valid number
+          // Strictly select ONLY the first valid match
           return cleanNumber;
         }
       }
@@ -86,8 +96,22 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
     return null;
   }
 
-  /// Pick image from source and process via Google ML Kit Text Recognition
+  /// Save detected phone number details into Cloud Firestore 'scanned_numbers' collection
+  Future<void> _saveToFirestore({
+    required String phoneNumber,
+    required String source,
+  }) async {
+    await FirebaseFirestore.instance.collection('scanned_numbers').add({
+      'phoneNumber': phoneNumber,
+      'createdAt': FieldValue.serverTimestamp(),
+      'source': source,
+    });
+  }
+
+  /// Pick image, perform OCR, save to Firestore, and open dialer
   Future<void> _pickAndProcessImage(ImageSource source) async {
+    final String sourceName = source == ImageSource.camera ? 'camera' : 'gallery';
+
     try {
       final XFile? pickedFile = await _picker.pickImage(
         source: source,
@@ -104,26 +128,21 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
         _detectedPhoneNumber = null;
       });
 
-      // Pass selected image to ML Kit Text Recognizer
+      // Step 1: Perform OCR using Google ML Kit
       final inputImage = InputImage.fromFilePath(pickedFile.path);
       final RecognizedText recognizedText =
           await _textRecognizer.processImage(inputImage);
 
-      // Extract ONLY the FIRST valid phone number
+      // Step 2: Extract strictly the FIRST valid phone number
       final String? foundPhoneNumber = _extractPhoneNumber(recognizedText.text);
 
-      setState(() {
-        _isProcessing = false;
-        _detectedPhoneNumber = foundPhoneNumber;
-      });
+      if (foundPhoneNumber == null || foundPhoneNumber.isEmpty) {
+        setState(() {
+          _isProcessing = false;
+        });
 
-      if (!mounted) return;
+        if (!mounted) return;
 
-      if (foundPhoneNumber != null && foundPhoneNumber.isNotEmpty) {
-        // Automatically open phone dialer pre-filled with extracted number
-        _openDialer(foundPhoneNumber);
-      } else {
-        // Show modern SnackBar if no phone number was detected
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: const Row(
@@ -147,7 +166,36 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
             duration: const Duration(seconds: 4),
           ),
         );
+        return;
       }
+
+      // Step 3: Save to Cloud Firestore
+      try {
+        await _saveToFirestore(
+          phoneNumber: foundPhoneNumber,
+          source: sourceName,
+        );
+      } catch (firestoreError) {
+        debugPrint("Firestore write error: $firestoreError");
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to save to Firestore: $firestoreError'),
+            backgroundColor: Colors.red.shade700,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+
+      setState(() {
+        _isProcessing = false;
+        _detectedPhoneNumber = foundPhoneNumber;
+      });
+
+      if (!mounted) return;
+
+      // Step 4: Launch native phone dialer automatically
+      _openDialer(foundPhoneNumber);
     } catch (e) {
       setState(() {
         _isProcessing = false;
@@ -165,7 +213,7 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
     }
   }
 
-  /// Launch native dialer with pre-filled phone number using tel: scheme
+  /// Launch native phone dialer pre-filled with the extracted number
   Future<void> _openDialer(String phoneNumber) async {
     final Uri telUri = Uri(scheme: 'tel', path: phoneNumber);
 
@@ -205,7 +253,7 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Selected Image Preview / Container
+              // Image Preview Area
               Expanded(
                 child: Container(
                   decoration: BoxDecoration(
@@ -247,10 +295,10 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
                           ],
                         ),
 
-                      // Loading Overlay while processing OCR
+                      // Loading Overlay during ML Kit OCR & Firestore Upload
                       if (_isProcessing)
                         Container(
-                          color: Colors.black.withOpacity(0.5),
+                          color: Colors.black.withOpacity(0.6),
                           child: Center(
                             child: Card(
                               elevation: 8,
@@ -270,10 +318,11 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
                                     ),
                                     const SizedBox(height: 16),
                                     const Text(
-                                      'Processing text with ML Kit...',
+                                      'Processing image and saving to database...',
                                       style: TextStyle(
                                         fontWeight: FontWeight.w600,
                                       ),
+                                      textAlign: TextAlign.center,
                                     ),
                                   ],
                                 ),
@@ -288,7 +337,7 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
 
               const SizedBox(height: 16),
 
-              // Detected Number Status Banner
+              // Detected Number Banner
               if (_detectedPhoneNumber != null)
                 Container(
                   padding: const EdgeInsets.all(16),
@@ -310,7 +359,7 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              'First Detected Phone Number',
+                              'Scanned & Saved Number',
                               style: theme.textTheme.labelMedium?.copyWith(
                                 color: colorScheme.onPrimaryContainer
                                     .withOpacity(0.8),
