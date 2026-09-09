@@ -19,8 +19,9 @@ void main() async {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
     );
+    debugPrint("Firebase initialized successfully.");
   } catch (e) {
-    debugPrint("Firebase initialization info: $e");
+    debugPrint("Firebase initialization info/error: $e");
   }
 
   try {
@@ -215,16 +216,16 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
       final String? foundPhoneNumber = _extractPhoneNumber(recognizedText.text);
 
       if (foundPhoneNumber != null && foundPhoneNumber.isNotEmpty && !_isLocked) {
-        // Lock stream immediately upon valid detection to prevent duplicate triggers
         _isLocked = true;
         await _stopCameraStream();
 
-        // Haptic feedback for Google Lens effect
         HapticFeedback.mediumImpact();
 
         setState(() {
           _detectedPhoneNumber = foundPhoneNumber;
         });
+
+        debugPrint("DETECTION SUCCESS: Found number '$foundPhoneNumber'");
 
         // Save to Firestore and launch dialer
         await _handleDetectedNumber(foundPhoneNumber, 'live_camera');
@@ -236,54 +237,157 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     }
   }
 
-  /// Smart Regex to prioritize phone numbers (7 to 15 digits), ignoring surrounding letters
+  /// Robust Phone Number Parser:
+  /// Prevents truncation (e.g., +91 9876543210 -> +919876543210 intact, not 543210).
+  /// Preserves country codes (+91, +1), leading 0s, and complete 10-digit Indian numbers [6-9]XXXXX.
   String? _extractPhoneNumber(String text) {
-    final RegExp phoneRegex = RegExp(
-      r'(?<![a-zA-Z0-9])(?:(?:\+|00)\d{1,4}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}(?![a-zA-Z0-9])',
-    );
+    if (text.isEmpty) return null;
 
-    final Iterable<RegExpMatch> matches = phoneRegex.allMatches(text);
+    final List<String> lines = text.split(RegExp(r'[\r\n]+'));
 
-    for (final match in matches) {
-      final rawMatch = match.group(0);
-      if (rawMatch != null) {
-        final cleanNumber = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
-        final digitCount = cleanNumber.replaceAll(RegExp(r'[^\d]'), '').length;
+    // Pattern 1: International format with + country code e.g. +91 9876543210 or +91-98765-43210
+    final RegExp intlRegex = RegExp(r'\+(?:[0-9][\s.-]?){8,15}\d');
 
-        if (digitCount >= 7 && digitCount <= 15) {
-          return cleanNumber;
+    // Pattern 2: Indian 10-digit mobile number starting with [6-9] e.g. 98765 43210, 9876543210
+    final RegExp indianRegex = RegExp(r'(?<!\d)[6-9]\d{4}[\s.-]?\d{5}(?!\d)');
+
+    // Pattern 3: Zero-leading numbers e.g. 09876543210
+    final RegExp zeroLeadingRegex = RegExp(r'(?<!\d)0[6-9]\d{4}[\s.-]?\d{5}(?!\d)');
+
+    // Pattern 4: Fallback contiguous digit sequence (10 to 15 digits)
+    final RegExp fallbackDigits = RegExp(r'(?<!\d)\+?\d{10,15}(?!\d)');
+
+    for (final line in lines) {
+      // 1. Check International Format (+91 9876543210)
+      final Iterable<RegExpMatch> intlMatches = intlRegex.allMatches(line);
+      for (final m in intlMatches) {
+        final raw = m.group(0);
+        if (raw != null) {
+          final clean = raw.replaceAll(RegExp(r'[^\d+]'), '');
+          final digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
+          if (digitsOnly.length >= 10 && digitsOnly.length <= 15) {
+            return clean;
+          }
+        }
+      }
+
+      // 2. Check Indian 10-Digit Mobile (9876543210)
+      final Iterable<RegExpMatch> indianMatches = indianRegex.allMatches(line);
+      for (final m in indianMatches) {
+        final raw = m.group(0);
+        if (raw != null) {
+          final clean = raw.replaceAll(RegExp(r'[^\d+]'), '');
+          final digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
+          if (digitsOnly.length == 10) {
+            return clean;
+          }
+        }
+      }
+
+      // 3. Check Zero Leading Mobile (09876543210)
+      final Iterable<RegExpMatch> zeroMatches = zeroLeadingRegex.allMatches(line);
+      for (final m in zeroMatches) {
+        final raw = m.group(0);
+        if (raw != null) {
+          final clean = raw.replaceAll(RegExp(r'[^\d+]'), '');
+          final digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
+          if (digitsOnly.length == 11) {
+            return clean;
+          }
+        }
+      }
+
+      // 4. Fallback 10-15 Digit Sequence
+      final Iterable<RegExpMatch> fallbackMatches = fallbackDigits.allMatches(line);
+      for (final m in fallbackMatches) {
+        final raw = m.group(0);
+        if (raw != null) {
+          final clean = raw.replaceAll(RegExp(r'[^\d+]'), '');
+          final digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
+          if (digitsOnly.length >= 10 && digitsOnly.length <= 15) {
+            return clean;
+          }
         }
       }
     }
+
+    // 5. Global sanitization fallback across un-split text blocks
+    final String wholeClean = text.replaceAll(RegExp(r'[^\d+]'), '');
+    final String wholeDigits = wholeClean.replaceAll(RegExp(r'[^\d]'), '');
+
+    if (wholeDigits.length >= 10 && wholeDigits.length <= 15) {
+      if (wholeClean.startsWith('+')) {
+        return wholeClean;
+      }
+      final match10 = RegExp(r'[6-9]\d{9}').firstMatch(wholeDigits);
+      if (match10 != null) {
+        return match10.group(0);
+      }
+      return wholeDigits;
+    }
+
     return null;
   }
 
-  /// Save to Firestore & automatically trigger phone dialer
+  /// Save to Cloud Firestore with explicit debug logging & open native dialer
   Future<void> _handleDetectedNumber(String phoneNumber, String source) async {
+    debugPrint("--------------------------------------------------");
+    debugPrint("--> FIRESTORE WRITE INITIATED");
+    debugPrint("    Target Collection: 'scanned_numbers'");
+    debugPrint("    Document Field 'phoneNumber': $phoneNumber");
+    debugPrint("    Document Field 'source': $source");
+    debugPrint("--------------------------------------------------");
+
     try {
-      await FirebaseFirestore.instance.collection('scanned_numbers').add({
+      final DocumentReference docRef =
+          await FirebaseFirestore.instance.collection('scanned_numbers').add({
         'phoneNumber': phoneNumber,
         'createdAt': FieldValue.serverTimestamp(),
         'source': source,
       });
-    } catch (e) {
-      debugPrint("Firestore upload error: $e");
+
+      debugPrint("--> FIRESTORE SUCCESS: Written Document ID '${docRef.id}'");
+    } catch (e, stackTrace) {
+      debugPrint("--> FIRESTORE ERROR: Failed to write document to Firestore: $e");
+      debugPrint("    StackTrace: $stackTrace");
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Firestore error: $e'),
+            backgroundColor: Colors.red.shade800,
+          ),
+        );
+      }
     }
 
+    // Launch dialer with cleaned number
     _openDialer(phoneNumber);
   }
 
-  /// Open native dialer using url_launcher with tel: scheme
+  /// Launch native dialer via url_launcher with LaunchMode.externalApplication
   Future<void> _openDialer(String phoneNumber) async {
+    final String cleanDigits = phoneNumber.replaceAll(RegExp(r'[^\d]'), '');
+
+    if (cleanDigits.length < 10 || cleanDigits.length > 15) {
+      debugPrint("Dialer launch skipped: Invalid digit count (${cleanDigits.length}) for number '$phoneNumber'");
+      return;
+    }
+
     final Uri telUri = Uri(scheme: 'tel', path: phoneNumber);
+    debugPrint("--> LAUNCHING DIALER: $telUri (mode: LaunchMode.externalApplication)");
 
     try {
-      if (await canLaunchUrl(telUri)) {
-        await launchUrl(telUri);
-      } else {
-        await launchUrl(telUri, mode: LaunchMode.externalApplication);
+      final bool launched = await launchUrl(
+        telUri,
+        mode: LaunchMode.externalApplication,
+      );
+
+      if (!launched) {
+        debugPrint("launchUrl returned false for $telUri");
       }
     } catch (e) {
+      debugPrint("Error launching dialer for $phoneNumber: $e");
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -294,7 +398,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     }
   }
 
-  /// Static photo selection fallback from Gallery using ImagePicker
+  /// Fallback Upload from Gallery using ImagePicker
   Future<void> _pickFromGallery() async {
     try {
       final XFile? pickedFile = await _imagePicker.pickImage(
@@ -443,7 +547,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
               ),
               child: Stack(
                 children: [
-                  // Corner accent indicators
                   Positioned(
                     top: 12,
                     left: 16,
@@ -568,7 +671,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
 
                 Row(
                   children: [
-                    // Fallback Upload from Gallery
                     Expanded(
                       child: OutlinedButton.icon(
                         onPressed: _pickFromGallery,
