@@ -8,8 +8,59 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 import 'package:url_launcher/url_launcher.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart' as p;
 
 import 'firebase_options.dart';
+
+// ---------------------------------------------------------------------------
+// DatabaseHelper — Offline SQLite call log
+// ---------------------------------------------------------------------------
+class DatabaseHelper {
+  static Database? _db;
+
+  static Future<Database> get database async {
+    if (_db != null) return _db!;
+    _db = await _initDb();
+    return _db!;
+  }
+
+  static Future<Database> _initDb() async {
+    final String dbPath = p.join(await getDatabasesPath(), 'call_log.db');
+    return openDatabase(
+      dbPath,
+      version: 1,
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE call_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone_number TEXT NOT NULL,
+            source TEXT NOT NULL,
+            synced INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+          )
+        ''');
+      },
+    );
+  }
+
+  /// Insert a call log entry. Safe to call without await — never throws to caller.
+  static Future<void> logCall(String phoneNumber, String source) async {
+    try {
+      final db = await database;
+      await db.insert('call_log', {
+        'phone_number': phoneNumber,
+        'source': source,
+        'synced': 0,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+      debugPrint('[SQLite] Call logged: $phoneNumber ($source)');
+    } catch (e) {
+      debugPrint('[SQLite] ERROR logging call: $e');
+    }
+  }
+}
 
 List<CameraDescription> _cameras = [];
 
@@ -64,11 +115,11 @@ class LiveCameraScannerScreen extends StatefulWidget {
 class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     with WidgetsBindingObserver {
   CameraController? _cameraController;
-  int _selectedCameraIndex = 0;
+  final int _selectedCameraIndex = 0;
   bool _isCameraInitialized = false;
 
   bool _isProcessingFrame = false;
-  bool _isLocked = false; // Lock flag to prevent duplicate scans
+  int _lastFrameProcessedTimestamp = 0;
   String? _detectedPhoneNumber;
   bool _isFlashOn = false;
 
@@ -109,7 +160,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     super.dispose();
   }
 
-  /// Initialize Camera Controller and start live stream
+  /// Initialize Camera Controller and start continuous live stream
   Future<void> _initCamera(CameraDescription cameraDescription) async {
     final CameraController cameraController = CameraController(
       cameraDescription,
@@ -136,7 +187,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     }
   }
 
-  /// Starts processing live frames from camera stream
+  /// Starts continuous stream processing for dynamic real-time tracking
   void _startCameraStream() {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
       return;
@@ -145,7 +196,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     if (_cameraController!.value.isStreamingImages) return;
 
     _cameraController!.startImageStream((CameraImage image) {
-      if (_isProcessingFrame || _isLocked) return;
       _processCameraFrame(image);
     });
   }
@@ -194,10 +244,19 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     );
   }
 
-  /// Process each camera frame instantaneously using ML Kit Text Recognition
+  /// Dynamic Real-Time Frame Processing (Face-Detection Style) with 300ms throttling
   Future<void> _processCameraFrame(CameraImage image) async {
     if (_cameraController == null) return;
+
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    // Process 1 frame every 300ms to maintain smooth 60 FPS performance without lag
+    if (now - _lastFrameProcessedTimestamp < 300) {
+      return;
+    }
+
+    if (_isProcessingFrame) return;
     _isProcessingFrame = true;
+    _lastFrameProcessedTimestamp = now;
 
     try {
       final inputImage = _inputImageFromCameraImage(
@@ -215,20 +274,26 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
 
       final String? foundPhoneNumber = _extractPhoneNumber(recognizedText.text);
 
-      if (foundPhoneNumber != null && foundPhoneNumber.isNotEmpty && !_isLocked) {
-        _isLocked = true;
-        await _stopCameraStream();
+      if (!mounted) return;
 
-        HapticFeedback.mediumImpact();
+      if (foundPhoneNumber != null && foundPhoneNumber.isNotEmpty) {
+        // Number detected in current frame -> Update state & highlight green
+        if (_detectedPhoneNumber != foundPhoneNumber) {
+          HapticFeedback.selectionClick();
+          debugPrint("REALTIME TRACKING: Phone number detected '$foundPhoneNumber'");
+        }
 
         setState(() {
           _detectedPhoneNumber = foundPhoneNumber;
         });
-
-        debugPrint("DETECTION SUCCESS: Found number '$foundPhoneNumber'");
-
-        // Save to Firestore and launch dialer
-        await _handleDetectedNumber(foundPhoneNumber, 'live_camera');
+      } else {
+        // Camera moved away / NO number in current frame -> Clear state immediately
+        if (_detectedPhoneNumber != null) {
+          debugPrint("REALTIME TRACKING: Number left camera view -> clearing frame");
+          setState(() {
+            _detectedPhoneNumber = null;
+          });
+        }
       }
     } catch (e) {
       debugPrint("Error processing camera frame: $e");
@@ -239,163 +304,274 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
 
   /// Robust Phone Number Parser:
   /// Prevents truncation (e.g., +91 9876543210 -> +919876543210 intact, not 543210).
-  /// Preserves country codes (+91, +1), leading 0s, and complete 10-digit Indian numbers [6-9]XXXXX.
+  /// Preserves country codes (+91), leading 0s, and complete 10-digit Indian numbers [6-9]XXXXX.
   String? _extractPhoneNumber(String text) {
     if (text.isEmpty) return null;
 
-    final List<String> lines = text.split(RegExp(r'[\r\n]+'));
+    // 1. Split into lines to evaluate individual line entries
+    final List<String> rawLines = text.split(RegExp(r'[\r\n]+'));
 
-    // Pattern 1: International format with + country code e.g. +91 9876543210 or +91-98765-43210
-    final RegExp intlRegex = RegExp(r'\+(?:[0-9][\s.-]?){8,15}\d');
+    // Regex for International format starting with '+'
+    // Matches '+' followed by digits, spaces, hyphens, parentheses, or dots
+    final RegExp intlPattern = RegExp(r'\+\d[\d\s\-\.\(\)]{8,20}');
 
-    // Pattern 2: Indian 10-digit mobile number starting with [6-9] e.g. 98765 43210, 9876543210
-    final RegExp indianRegex = RegExp(r'(?<!\d)[6-9]\d{4}[\s.-]?\d{5}(?!\d)');
+    // Regex for 11-digit zero-leading numbers starting with 0 then [6-9]
+    final RegExp zeroIndianPattern = RegExp(r'(?<!\d)0[\s\.-]?[6-9]\d{4}[\s\.-]?\d{5}(?!\d)');
 
-    // Pattern 3: Zero-leading numbers e.g. 09876543210
-    final RegExp zeroLeadingRegex = RegExp(r'(?<!\d)0[6-9]\d{4}[\s.-]?\d{5}(?!\d)');
+    // Regex for 10-digit Indian numbers starting with [6-9]
+    final RegExp indianPattern = RegExp(r'(?<!\d)[6-9]\d{4}[\s\.-]?\d{5}(?!\d)');
 
-    // Pattern 4: Fallback contiguous digit sequence (10 to 15 digits)
-    final RegExp fallbackDigits = RegExp(r'(?<!\d)\+?\d{10,15}(?!\d)');
+    // Regex for generic contiguous or spaced digit sequences (10-15 digits)
+    final RegExp genericPattern = RegExp(r'(?<!\d)\+?\d[\d\s\-\.]{8,20}\d(?!\d)');
 
-    for (final line in lines) {
-      // 1. Check International Format (+91 9876543210)
-      final Iterable<RegExpMatch> intlMatches = intlRegex.allMatches(line);
-      for (final m in intlMatches) {
-        final raw = m.group(0);
-        if (raw != null) {
-          final clean = raw.replaceAll(RegExp(r'[^\d+]'), '');
-          final digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
-          if (digitsOnly.length >= 10 && digitsOnly.length <= 15) {
-            return clean;
-          }
+    for (final line in rawLines) {
+      final String trimmedLine = line.trim();
+      if (trimmedLine.isEmpty) continue;
+
+      // Check 1: International format starting with '+' e.g. +91 98765 43210 or +91-9876543210
+      for (final Match m in intlPattern.allMatches(trimmedLine)) {
+        final String rawMatch = m.group(0)!;
+        final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
+        final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
+        if (digitsOnly.length >= 10 && digitsOnly.length <= 15 && clean.startsWith('+')) {
+          return clean;
         }
       }
 
-      // 2. Check Indian 10-Digit Mobile (9876543210)
-      final Iterable<RegExpMatch> indianMatches = indianRegex.allMatches(line);
-      for (final m in indianMatches) {
-        final raw = m.group(0);
-        if (raw != null) {
-          final clean = raw.replaceAll(RegExp(r'[^\d+]'), '');
-          final digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
-          if (digitsOnly.length == 10) {
-            return clean;
-          }
+      // Check 2: Zero-leading Indian numbers e.g. 09876543210 or 0 98765 43210
+      for (final Match m in zeroIndianPattern.allMatches(trimmedLine)) {
+        final String rawMatch = m.group(0)!;
+        final String clean = rawMatch.replaceAll(RegExp(r'[^\d]'), '');
+        if (clean.length == 11 && clean.startsWith('0')) {
+          return clean;
         }
       }
 
-      // 3. Check Zero Leading Mobile (09876543210)
-      final Iterable<RegExpMatch> zeroMatches = zeroLeadingRegex.allMatches(line);
-      for (final m in zeroMatches) {
-        final raw = m.group(0);
-        if (raw != null) {
-          final clean = raw.replaceAll(RegExp(r'[^\d+]'), '');
-          final digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
-          if (digitsOnly.length == 11) {
-            return clean;
-          }
+      // Check 3: Standard 10-digit Indian numbers starting with [6-9]
+      for (final Match m in indianPattern.allMatches(trimmedLine)) {
+        final String rawMatch = m.group(0)!;
+        final String clean = rawMatch.replaceAll(RegExp(r'[^\d]'), '');
+        if (clean.length == 10 && RegExp(r'^[6-9]').hasMatch(clean)) {
+          return clean;
         }
       }
 
-      // 4. Fallback 10-15 Digit Sequence
-      final Iterable<RegExpMatch> fallbackMatches = fallbackDigits.allMatches(line);
-      for (final m in fallbackMatches) {
-        final raw = m.group(0);
-        if (raw != null) {
-          final clean = raw.replaceAll(RegExp(r'[^\d+]'), '');
-          final digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
-          if (digitsOnly.length >= 10 && digitsOnly.length <= 15) {
-            return clean;
-          }
+      // Check 4: Generic pattern within the line
+      for (final Match m in genericPattern.allMatches(trimmedLine)) {
+        final String rawMatch = m.group(0)!;
+        final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
+        final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
+        if (digitsOnly.length >= 10 && digitsOnly.length <= 15) {
+          return clean;
         }
       }
     }
 
-    // 5. Global sanitization fallback across un-split text blocks
-    final String wholeClean = text.replaceAll(RegExp(r'[^\d+]'), '');
-    final String wholeDigits = wholeClean.replaceAll(RegExp(r'[^\d]'), '');
+    // 2. Global Fallback across whole text (handles multi-line splits from ML Kit)
+    final String sanitized = text.replaceAll(RegExp(r'[^\d+\s\-]'), ' ');
 
-    if (wholeDigits.length >= 10 && wholeDigits.length <= 15) {
-      if (wholeClean.startsWith('+')) {
-        return wholeClean;
+    // Check for + international format globally
+    for (final Match m in intlPattern.allMatches(sanitized)) {
+      final String rawMatch = m.group(0)!;
+      final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
+      final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
+      if (digitsOnly.length >= 10 && digitsOnly.length <= 15 && clean.startsWith('+')) {
+        return clean;
       }
-      final match10 = RegExp(r'[6-9]\d{9}').firstMatch(wholeDigits);
-      if (match10 != null) {
-        return match10.group(0);
-      }
-      return wholeDigits;
+    }
+
+    // Global digits-only extraction
+    final String allDigits = text.replaceAll(RegExp(r'[^\d]'), '');
+
+    // 11-digit starting with 0 and [6-9]
+    final Match? zeroMatch = RegExp(r'0[6-9]\d{9}').firstMatch(allDigits);
+    if (zeroMatch != null) {
+      return zeroMatch.group(0);
+    }
+
+    // 10-digit starting with [6-9]
+    final Match? indianMatch = RegExp(r'[6-9]\d{9}').firstMatch(allDigits);
+    if (indianMatch != null) {
+      return indianMatch.group(0);
+    }
+
+    // 10-15 digit fallback sequence
+    if (allDigits.length >= 10 && allDigits.length <= 15) {
+      return allDigits;
     }
 
     return null;
   }
 
-  /// Save to Cloud Firestore with explicit debug logging & open native dialer
+  /// Full robust Call Button handler:
+  /// 1. Saves to Firestore (non-blocking on failure)
+  /// 2. Checks CALL_PHONE permission safely
+  /// 3. Non-blocking SQLite offline log via Future.microtask
+  /// 4. Launches native dialer with exhaustive debugPrint tracing
   Future<void> _handleDetectedNumber(String phoneNumber, String source) async {
-    debugPrint("--------------------------------------------------");
-    debugPrint("--> FIRESTORE WRITE INITIATED");
-    debugPrint("    Target Collection: 'scanned_numbers'");
-    debugPrint("    Document Field 'phoneNumber': $phoneNumber");
-    debugPrint("    Document Field 'source': $source");
-    debugPrint("--------------------------------------------------");
+    debugPrint('======================================================');
+    debugPrint('[CALL FLOW] START — number: $phoneNumber | source: $source');
+    debugPrint('======================================================');
 
-    try {
-      final DocumentReference docRef =
-          await FirebaseFirestore.instance.collection('scanned_numbers').add({
-        'phoneNumber': phoneNumber,
-        'createdAt': FieldValue.serverTimestamp(),
-        'source': source,
-      });
+    // ── STEP 1: Sanitize immediately ──────────────────────────────────────────
+    final String sanitized = phoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
+    final String digitsOnly = sanitized.replaceAll('+', '');
+    debugPrint('[CALL FLOW] Step 1 — Sanitized: "$sanitized" | Digits: ${digitsOnly.length}');
 
-      debugPrint("--> FIRESTORE SUCCESS: Written Document ID '${docRef.id}'");
-    } catch (e, stackTrace) {
-      debugPrint("--> FIRESTORE ERROR: Failed to write document to Firestore: $e");
-      debugPrint("    StackTrace: $stackTrace");
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Firestore error: $e'),
-            backgroundColor: Colors.red.shade800,
-          ),
-        );
-      }
-    }
-
-    // Launch dialer with cleaned number
-    _openDialer(phoneNumber);
-  }
-
-  /// Launch native dialer via url_launcher with LaunchMode.externalApplication
-  Future<void> _openDialer(String phoneNumber) async {
-    final String cleanDigits = phoneNumber.replaceAll(RegExp(r'[^\d]'), '');
-
-    if (cleanDigits.length < 10 || cleanDigits.length > 15) {
-      debugPrint("Dialer launch skipped: Invalid digit count (${cleanDigits.length}) for number '$phoneNumber'");
+    if (digitsOnly.length < 10 || digitsOnly.length > 15) {
+      debugPrint('[CALL FLOW] ABORT — Invalid digit count: ${digitsOnly.length}');
       return;
     }
 
-    final Uri telUri = Uri(scheme: 'tel', path: phoneNumber);
-    debugPrint("--> LAUNCHING DIALER: $telUri (mode: LaunchMode.externalApplication)");
+    // ── STEP 2: Non-blocking Firestore write (never blocks dialer) ────────────
+    Future.microtask(() async {
+      debugPrint('[FIRESTORE] Writing to scanned_numbers...');
+      try {
+        final DocumentReference docRef = await FirebaseFirestore.instance
+            .collection('scanned_numbers')
+            .add({
+          'phoneNumber': sanitized,
+          'createdAt': FieldValue.serverTimestamp(),
+          'source': source,
+        });
+        debugPrint('[FIRESTORE] SUCCESS — Doc ID: ${docRef.id}');
+      } catch (e) {
+        debugPrint('[FIRESTORE] ERROR (non-fatal): $e');
+      }
+    });
 
+    // ── STEP 3: Non-blocking SQLite offline log (DatabaseHelper) ─────────────
+    // Wrapped in Future.microtask so DB errors NEVER block or crash the dialer.
+    Future.microtask(() => DatabaseHelper.logCall(sanitized, source));
+
+    // ── STEP 4: Permission check for CALL_PHONE ───────────────────────────────
+    // NOTE: Opening the dialer pad (tel:) does NOT require CALL_PHONE permission.
+    // Only android.intent.action.CALL (direct call without user prompt) needs it.
+    // We check it anyway; on denial we still proceed to open the dialer pad safely.
+    debugPrint('[CALL FLOW] Step 4 — Checking Permission.phone...');
+    PermissionStatus phonePermStatus;
+    try {
+      phonePermStatus = await Permission.phone.status;
+      debugPrint('[PERMISSION] Current status: $phonePermStatus');
+
+      if (phonePermStatus.isDenied) {
+        phonePermStatus = await Permission.phone.request();
+        debugPrint('[PERMISSION] After request: $phonePermStatus');
+      }
+
+      if (phonePermStatus.isPermanentlyDenied) {
+        debugPrint('[PERMISSION] Permanently denied — opening app settings nudge');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text(
+                'Phone permission denied. Opening dialer pad instead.',
+                style: TextStyle(fontWeight: FontWeight.w500),
+              ),
+              backgroundColor: Colors.orange.shade800,
+              action: const SnackBarAction(
+                label: 'Settings',
+                textColor: Colors.white,
+                onPressed: openAppSettings,
+              ),
+              behavior: SnackBarBehavior.floating,
+              margin: const EdgeInsets.all(16),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+          );
+        }
+        // Fallback: still open dialer pad (tel: only shows pad, no CALL_PHONE needed)
+      }
+    } catch (e) {
+      // permission_handler can throw on desktop/unsupported — treat as granted, proceed
+      debugPrint('[PERMISSION] Exception (non-fatal, proceeding): $e');
+    }
+
+    // ── STEP 5: Launch native dialer ──────────────────────────────────────────
+    await _openDialer(sanitized);
+
+    debugPrint('[CALL FLOW] END — dialer launch attempted for $sanitized');
+    debugPrint('======================================================');
+  }
+
+  /// Launch native dialer via url_launcher.
+  /// Expects an already-sanitized number (digits + optional leading '+').
+  /// Step-by-step debugPrint tracing at every decision point.
+  Future<void> _openDialer(String sanitized) async {
+    debugPrint('[DIALER] Step A — Input: "$sanitized"');
+
+    // A. Build URI
+    final Uri telUri = Uri.parse('tel:$sanitized');
+    debugPrint('[DIALER] Step B — URI built: $telUri');
+
+    // B. canLaunchUrl check
+    bool canLaunch = false;
+    try {
+      canLaunch = await canLaunchUrl(telUri);
+      debugPrint('[DIALER] Step C — canLaunchUrl: $canLaunch');
+    } catch (e) {
+      debugPrint('[DIALER] Step C — canLaunchUrl EXCEPTION: $e');
+    }
+
+    if (!canLaunch) {
+      debugPrint('[DIALER] ABORT — No app can handle tel: scheme on this device');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('No dialer app found for $sanitized'),
+          backgroundColor: Colors.orange.shade800,
+          behavior: SnackBarBehavior.floating,
+          margin: const EdgeInsets.all(16),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        ),
+      );
+      return;
+    }
+
+    // C. Attempt primary launch: externalNonBrowserApplication
+    debugPrint('[DIALER] Step D — Attempting launchUrl (externalNonBrowserApplication)...');
+    try {
+      final bool launched = await launchUrl(
+        telUri,
+        mode: LaunchMode.externalNonBrowserApplication,
+      );
+      debugPrint('[DIALER] Step D — launchUrl returned: $launched');
+      if (launched) {
+        debugPrint('[DIALER] SUCCESS ✓ — Native dialer opened for $sanitized');
+        return;
+      }
+    } catch (e) {
+      debugPrint('[DIALER] Step D — EXCEPTION: $e — trying fallback mode...');
+    }
+
+    // D. Fallback: externalApplication mode
+    debugPrint('[DIALER] Step E — Fallback: launchUrl (externalApplication)...');
     try {
       final bool launched = await launchUrl(
         telUri,
         mode: LaunchMode.externalApplication,
       );
-
-      if (!launched) {
-        debugPrint("launchUrl returned false for $telUri");
+      debugPrint('[DIALER] Step E — Fallback returned: $launched');
+      if (launched) {
+        debugPrint('[DIALER] SUCCESS (fallback) ✓ — Dialer opened for $sanitized');
+        return;
       }
     } catch (e) {
-      debugPrint("Error launching dialer for $phoneNumber: $e");
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Could not launch dialer for $phoneNumber'),
-          backgroundColor: Colors.red.shade700,
-        ),
-      );
+      debugPrint('[DIALER] Step E — Fallback EXCEPTION: $e');
     }
+
+    // E. Both modes failed — show SnackBar
+    debugPrint('[DIALER] FAILED — Both launch modes returned false/threw for $sanitized');
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Could not open dialer for $sanitized'),
+        backgroundColor: Colors.red.shade700,
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
   }
 
   /// Fallback Upload from Gallery using ImagePicker
@@ -409,11 +585,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
       );
 
       if (pickedFile == null) return;
-
-      setState(() {
-        _isLocked = true;
-      });
-      await _stopCameraStream();
 
       final inputImage = InputImage.fromFilePath(pickedFile.path);
       final RecognizedText recognizedText =
@@ -430,11 +601,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
 
         await _handleDetectedNumber(foundPhoneNumber, 'gallery');
       } else {
-        setState(() {
-          _isLocked = false;
-        });
-        _startCameraStream();
-
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -464,15 +630,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     }
   }
 
-  /// Reset scanner lock to allow continuous scanning again
-  void _resetScanner() {
-    setState(() {
-      _isLocked = false;
-      _detectedPhoneNumber = null;
-    });
-    _startCameraStream();
-  }
-
   /// Toggle flashlight
   Future<void> _toggleFlash() async {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
@@ -496,12 +653,13 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
+    final bool hasDetectedNumber = _detectedPhoneNumber != null;
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // 1. Live Camera Preview
+          // 1. Continuous Live Camera Preview
           if (_isCameraInitialized && _cameraController != null)
             SizedBox.expand(
               child: CameraPreview(_cameraController!),
@@ -521,70 +679,135 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
               ),
             ),
 
-          // 2. Google Lens Style Bounding Box Overlay
+          // 2. Real-Time Dynamic Tracking Bounding Box Overlay (Face-Detection Style)
           Center(
-            child: Container(
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
               width: size.width * 0.85,
-              height: 160,
+              height: hasDetectedNumber ? 200 : 160,
+              padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(20),
+                borderRadius: BorderRadius.circular(24),
                 border: Border.all(
-                  color: _detectedPhoneNumber != null
+                  color: hasDetectedNumber
                       ? Colors.greenAccent
                       : const Color(0xFF6366F1),
-                  width: 3.0,
+                  width: 3.5,
                 ),
                 boxShadow: [
                   BoxShadow(
-                    color: (_detectedPhoneNumber != null
+                    color: (hasDetectedNumber
                             ? Colors.greenAccent
                             : const Color(0xFF6366F1))
-                        .withOpacity(0.3),
-                    blurRadius: 20,
-                    spreadRadius: 2,
+                        .withValues(alpha: 0.35),
+                    blurRadius: 24,
+                    spreadRadius: 3,
                   ),
                 ],
               ),
-              child: Stack(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Positioned(
-                    top: 12,
-                    left: 16,
-                    child: Text(
-                      _detectedPhoneNumber != null
-                          ? 'NUMBER DETECTED'
-                          : 'ALIGN PHONE NUMBER HERE',
+                  // Top Tracking Status Indicator
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: hasDetectedNumber
+                              ? Colors.greenAccent
+                              : const Color(0xFF6366F1),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        hasDetectedNumber
+                            ? 'NUMBER TRACKED'
+                            : 'ALIGN PHONE NUMBER HERE',
+                        style: TextStyle(
+                          color: hasDetectedNumber
+                              ? Colors.greenAccent
+                              : Colors.white70,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.2,
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  // Middle Detected Phone Number Display
+                  if (hasDetectedNumber)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.85),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: Colors.greenAccent.withValues(alpha: 0.5),
+                          width: 1.0,
+                        ),
+                      ),
+                      child: Text(
+                        _detectedPhoneNumber!,
+                        style: const TextStyle(
+                          color: Colors.greenAccent,
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                    )
+                  else
+                    const Text(
+                      'Point camera at any phone number',
                       style: TextStyle(
-                        color: _detectedPhoneNumber != null
-                            ? Colors.greenAccent
-                            : Colors.white70,
-                        fontSize: 12,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 1.2,
+                        color: Colors.white38,
+                        fontSize: 13,
                       ),
                     ),
-                  ),
-                  if (_detectedPhoneNumber != null)
-                    Center(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 8,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.85),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Text(
+
+                  // Interactive "Call <number>" Action Button
+                  if (hasDetectedNumber)
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: () => _handleDetectedNumber(
                           _detectedPhoneNumber!,
+                          'live_camera',
+                        ),
+                        icon: const Icon(
+                          Icons.phone_in_talk_rounded,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                        label: Text(
+                          'Call $_detectedPhoneNumber',
                           style: const TextStyle(
-                            color: Colors.greenAccent,
-                            fontSize: 22,
+                            color: Colors.white,
+                            fontSize: 15,
                             fontWeight: FontWeight.bold,
                           ),
                         ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green.shade600,
+                          foregroundColor: Colors.white,
+                          elevation: 6,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
                       ),
-                    ),
+                    )
+                  else
+                    const SizedBox(height: 8),
                 ],
               ),
             ),
@@ -603,19 +826,19 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                       vertical: 8,
                     ),
                     decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.6),
+                      color: Colors.black.withValues(alpha: 0.6),
                       borderRadius: BorderRadius.circular(20),
                     ),
                     child: const Row(
                       children: [
                         Icon(
-                          Icons.camera_alt_rounded,
+                          Icons.center_focus_strong_rounded,
                           color: Color(0xFF6366F1),
                           size: 18,
                         ),
                         SizedBox(width: 8),
                         Text(
-                          'Google Lens AI Scanner',
+                          'Real-Time Lens Scanner',
                           style: TextStyle(
                             color: Colors.white,
                             fontWeight: FontWeight.bold,
@@ -627,7 +850,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                   ),
                   IconButton(
                     style: IconButton.styleFrom(
-                      backgroundColor: Colors.black.withOpacity(0.6),
+                      backgroundColor: Colors.black.withValues(alpha: 0.6),
                     ),
                     onPressed: _toggleFlash,
                     icon: Icon(
@@ -640,61 +863,35 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
             ),
           ),
 
-          // 4. Bottom Control Bar (Gallery Fallback & Rescan Button)
+          // 4. Bottom Control Bar (Upload from Gallery)
           Positioned(
             bottom: 30,
             left: 20,
             right: 20,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+            child: Row(
               children: [
-                if (_isLocked)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 12.0),
-                    child: ElevatedButton.icon(
-                      onPressed: _resetScanner,
-                      icon: const Icon(Icons.refresh_rounded),
-                      label: const Text('Scan Another Number'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF6366F1),
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 24,
-                          vertical: 14,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16),
-                        ),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _pickFromGallery,
+                    icon: const Icon(Icons.photo_library_rounded),
+                    label: const Text('Upload from Gallery'),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      foregroundColor: Colors.white,
+                      backgroundColor: Colors.black.withValues(alpha: 0.6),
+                      side: const BorderSide(
+                        color: Colors.white38,
+                        width: 1.5,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      textStyle: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
                   ),
-
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: _pickFromGallery,
-                        icon: const Icon(Icons.photo_library_rounded),
-                        label: const Text('Upload from Gallery'),
-                        style: OutlinedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 16),
-                          foregroundColor: Colors.white,
-                          backgroundColor: Colors.black.withOpacity(0.6),
-                          side: const BorderSide(
-                            color: Colors.white38,
-                            width: 1.5,
-                          ),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          textStyle: const TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
                 ),
               ],
             ),
