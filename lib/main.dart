@@ -1,5 +1,8 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:camera/camera.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -7,6 +10,8 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 import 'firebase_options.dart';
+
+List<CameraDescription> _cameras = [];
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,6 +22,13 @@ void main() async {
   } catch (e) {
     debugPrint("Firebase initialization info: $e");
   }
+
+  try {
+    _cameras = await availableCameras();
+  } catch (e) {
+    debugPrint("Failed to get available cameras: $e");
+  }
+
   runApp(const PhoneExtractorApp());
 }
 
@@ -26,52 +38,205 @@ class PhoneExtractorApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Phone Scanner AI',
+      title: 'Google Lens Style Live Scanner',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF6366F1),
-          brightness: Brightness.light,
-        ),
-      ),
-      darkTheme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF6366F1),
           brightness: Brightness.dark,
         ),
       ),
-      home: const PhoneScannerScreen(),
+      home: const LiveCameraScannerScreen(),
     );
   }
 }
 
-class PhoneScannerScreen extends StatefulWidget {
-  const PhoneScannerScreen({super.key});
+class LiveCameraScannerScreen extends StatefulWidget {
+  const LiveCameraScannerScreen({super.key});
 
   @override
-  State<PhoneScannerScreen> createState() => _PhoneScannerScreenState();
+  State<LiveCameraScannerScreen> createState() =>
+      _LiveCameraScannerScreenState();
 }
 
-class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
-  File? _selectedImage;
-  bool _isProcessing = false;
-  String? _detectedPhoneNumber;
+class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
+    with WidgetsBindingObserver {
+  CameraController? _cameraController;
+  int _selectedCameraIndex = 0;
+  bool _isCameraInitialized = false;
 
-  final ImagePicker _picker = ImagePicker();
+  bool _isProcessingFrame = false;
+  bool _isLocked = false; // Lock flag to prevent duplicate scans
+  String? _detectedPhoneNumber;
+  bool _isFlashOn = false;
+
+  final ImagePicker _imagePicker = ImagePicker();
   final TextRecognizer _textRecognizer = TextRecognizer(
     script: TextRecognitionScript.latin,
   );
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    if (_cameras.isNotEmpty) {
+      _initCamera(_cameras[_selectedCameraIndex]);
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final CameraController? cameraController = _cameraController;
+    if (cameraController == null || !cameraController.value.isInitialized) {
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive) {
+      _stopCameraStream();
+    } else if (state == AppLifecycleState.resumed) {
+      _initCamera(cameraController.description);
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _stopCameraStream();
+    _cameraController?.dispose();
     _textRecognizer.close();
     super.dispose();
   }
 
-  /// Smart Regex to extract phone numbers while completely ignoring surrounding alphabetic text.
-  /// Strictly returns ONLY the FIRST valid phone number match (7 to 15 digits).
+  /// Initialize Camera Controller and start live stream
+  Future<void> _initCamera(CameraDescription cameraDescription) async {
+    final CameraController cameraController = CameraController(
+      cameraDescription,
+      ResolutionPreset.high,
+      enableAudio: false,
+      imageFormatGroup: Platform.isAndroid
+          ? ImageFormatGroup.nv21
+          : ImageFormatGroup.bgra8888,
+    );
+
+    _cameraController = cameraController;
+
+    try {
+      await cameraController.initialize();
+      if (!mounted) return;
+
+      setState(() {
+        _isCameraInitialized = true;
+      });
+
+      _startCameraStream();
+    } catch (e) {
+      debugPrint("Camera initialization error: $e");
+    }
+  }
+
+  /// Starts processing live frames from camera stream
+  void _startCameraStream() {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return;
+    }
+
+    if (_cameraController!.value.isStreamingImages) return;
+
+    _cameraController!.startImageStream((CameraImage image) {
+      if (_isProcessingFrame || _isLocked) return;
+      _processCameraFrame(image);
+    });
+  }
+
+  /// Stops camera image stream safely
+  Future<void> _stopCameraStream() async {
+    if (_cameraController != null &&
+        _cameraController!.value.isInitialized &&
+        _cameraController!.value.isStreamingImages) {
+      try {
+        await _cameraController!.stopImageStream();
+      } catch (e) {
+        debugPrint("Error stopping image stream: $e");
+      }
+    }
+  }
+
+  /// Convert CameraImage frame to InputImage for Google ML Kit
+  InputImage? _inputImageFromCameraImage(
+      CameraImage image, CameraDescription camera) {
+    final sensorOrientation = camera.sensorOrientation;
+    InputImageRotation? rotation =
+        InputImageRotationValue.fromRawValue(sensorOrientation);
+    if (rotation == null) return null;
+
+    final format = InputImageFormatValue.fromRawValue(image.format.raw);
+    final inputImageFormat = format ??
+        (Platform.isAndroid
+            ? InputImageFormat.nv21
+            : InputImageFormat.bgra8888);
+
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final Plane plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final bytes = allBytes.done().buffer.asUint8List();
+
+    return InputImage.fromBytes(
+      bytes: bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: inputImageFormat,
+        bytesPerRow: image.planes[0].bytesPerRow,
+      ),
+    );
+  }
+
+  /// Process each camera frame instantaneously using ML Kit Text Recognition
+  Future<void> _processCameraFrame(CameraImage image) async {
+    if (_cameraController == null) return;
+    _isProcessingFrame = true;
+
+    try {
+      final inputImage = _inputImageFromCameraImage(
+        image,
+        _cameraController!.description,
+      );
+
+      if (inputImage == null) {
+        _isProcessingFrame = false;
+        return;
+      }
+
+      final RecognizedText recognizedText =
+          await _textRecognizer.processImage(inputImage);
+
+      final String? foundPhoneNumber = _extractPhoneNumber(recognizedText.text);
+
+      if (foundPhoneNumber != null && foundPhoneNumber.isNotEmpty && !_isLocked) {
+        // Lock stream immediately upon valid detection to prevent duplicate triggers
+        _isLocked = true;
+        await _stopCameraStream();
+
+        // Haptic feedback for Google Lens effect
+        HapticFeedback.mediumImpact();
+
+        setState(() {
+          _detectedPhoneNumber = foundPhoneNumber;
+        });
+
+        // Save to Firestore and launch dialer
+        await _handleDetectedNumber(foundPhoneNumber, 'live_camera');
+      }
+    } catch (e) {
+      debugPrint("Error processing camera frame: $e");
+    } finally {
+      _isProcessingFrame = false;
+    }
+  }
+
+  /// Smart Regex to prioritize phone numbers (7 to 15 digits), ignoring surrounding letters
   String? _extractPhoneNumber(String text) {
     final RegExp phoneRegex = RegExp(
       r'(?<![a-zA-Z0-9])(?:(?:\+|00)\d{1,4}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}(?![a-zA-Z0-9])',
@@ -82,13 +247,10 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
     for (final match in matches) {
       final rawMatch = match.group(0);
       if (rawMatch != null) {
-        // Strip non-digit and non-plus characters
         final cleanNumber = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
         final digitCount = cleanNumber.replaceAll(RegExp(r'[^\d]'), '').length;
 
-        // Valid phone number length according to ITU E.164 (7 to 15 digits)
         if (digitCount >= 7 && digitCount <= 15) {
-          // Strictly select ONLY the first valid match
           return cleanNumber;
         }
       }
@@ -96,124 +258,22 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
     return null;
   }
 
-  /// Save detected phone number details into Cloud Firestore 'scanned_numbers' collection
-  Future<void> _saveToFirestore({
-    required String phoneNumber,
-    required String source,
-  }) async {
-    await FirebaseFirestore.instance.collection('scanned_numbers').add({
-      'phoneNumber': phoneNumber,
-      'createdAt': FieldValue.serverTimestamp(),
-      'source': source,
-    });
-  }
-
-  /// Pick image, perform OCR, save to Firestore, and open dialer
-  Future<void> _pickAndProcessImage(ImageSource source) async {
-    final String sourceName = source == ImageSource.camera ? 'camera' : 'gallery';
-
+  /// Save to Firestore & automatically trigger phone dialer
+  Future<void> _handleDetectedNumber(String phoneNumber, String source) async {
     try {
-      final XFile? pickedFile = await _picker.pickImage(
-        source: source,
-        maxWidth: 1920,
-        maxHeight: 1920,
-        imageQuality: 90,
-      );
-
-      if (pickedFile == null) return;
-
-      setState(() {
-        _selectedImage = File(pickedFile.path);
-        _isProcessing = true;
-        _detectedPhoneNumber = null;
+      await FirebaseFirestore.instance.collection('scanned_numbers').add({
+        'phoneNumber': phoneNumber,
+        'createdAt': FieldValue.serverTimestamp(),
+        'source': source,
       });
-
-      // Step 1: Perform OCR using Google ML Kit
-      final inputImage = InputImage.fromFilePath(pickedFile.path);
-      final RecognizedText recognizedText =
-          await _textRecognizer.processImage(inputImage);
-
-      // Step 2: Extract strictly the FIRST valid phone number
-      final String? foundPhoneNumber = _extractPhoneNumber(recognizedText.text);
-
-      if (foundPhoneNumber == null || foundPhoneNumber.isEmpty) {
-        setState(() {
-          _isProcessing = false;
-        });
-
-        if (!mounted) return;
-
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Row(
-              children: [
-                Icon(Icons.warning_amber_rounded, color: Colors.white),
-                SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'No phone number detected in the image',
-                    style: TextStyle(fontWeight: FontWeight.w500),
-                  ),
-                ),
-              ],
-            ),
-            backgroundColor: Colors.orange.shade800,
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
-            ),
-            margin: const EdgeInsets.all(16),
-            duration: const Duration(seconds: 4),
-          ),
-        );
-        return;
-      }
-
-      // Step 3: Save to Cloud Firestore
-      try {
-        await _saveToFirestore(
-          phoneNumber: foundPhoneNumber,
-          source: sourceName,
-        );
-      } catch (firestoreError) {
-        debugPrint("Firestore write error: $firestoreError");
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to save to Firestore: $firestoreError'),
-            backgroundColor: Colors.red.shade700,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
-      }
-
-      setState(() {
-        _isProcessing = false;
-        _detectedPhoneNumber = foundPhoneNumber;
-      });
-
-      if (!mounted) return;
-
-      // Step 4: Launch native phone dialer automatically
-      _openDialer(foundPhoneNumber);
     } catch (e) {
-      setState(() {
-        _isProcessing = false;
-      });
-
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error processing image: $e'),
-          backgroundColor: Colors.red.shade700,
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
+      debugPrint("Firestore upload error: $e");
     }
+
+    _openDialer(phoneNumber);
   }
 
-  /// Launch native phone dialer pre-filled with the extracted number
+  /// Open native dialer using url_launcher with tel: scheme
   Future<void> _openDialer(String phoneNumber) async {
     final Uri telUri = Uri(scheme: 'tel', path: phoneNumber);
 
@@ -234,208 +294,310 @@ class _PhoneScannerScreenState extends State<PhoneScannerScreen> {
     }
   }
 
+  /// Static photo selection fallback from Gallery using ImagePicker
+  Future<void> _pickFromGallery() async {
+    try {
+      final XFile? pickedFile = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1920,
+        maxHeight: 1920,
+        imageQuality: 90,
+      );
+
+      if (pickedFile == null) return;
+
+      setState(() {
+        _isLocked = true;
+      });
+      await _stopCameraStream();
+
+      final inputImage = InputImage.fromFilePath(pickedFile.path);
+      final RecognizedText recognizedText =
+          await _textRecognizer.processImage(inputImage);
+
+      final String? foundPhoneNumber = _extractPhoneNumber(recognizedText.text);
+
+      if (foundPhoneNumber != null && foundPhoneNumber.isNotEmpty) {
+        HapticFeedback.heavyImpact();
+
+        setState(() {
+          _detectedPhoneNumber = foundPhoneNumber;
+        });
+
+        await _handleDetectedNumber(foundPhoneNumber, 'gallery');
+      } else {
+        setState(() {
+          _isLocked = false;
+        });
+        _startCameraStream();
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Row(
+              children: [
+                Icon(Icons.warning_amber_rounded, color: Colors.white),
+                SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'No phone number detected in the image',
+                    style: TextStyle(fontWeight: FontWeight.w500),
+                  ),
+                ),
+              ],
+            ),
+            backgroundColor: Colors.orange.shade800,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            margin: const EdgeInsets.all(16),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint("Gallery processing error: $e");
+    }
+  }
+
+  /// Reset scanner lock to allow continuous scanning again
+  void _resetScanner() {
+    setState(() {
+      _isLocked = false;
+      _detectedPhoneNumber = null;
+    });
+    _startCameraStream();
+  }
+
+  /// Toggle flashlight
+  Future<void> _toggleFlash() async {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return;
+    }
+
+    try {
+      if (_isFlashOn) {
+        await _cameraController!.setFlashMode(FlashMode.off);
+      } else {
+        await _cameraController!.setFlashMode(FlashMode.torch);
+      }
+      setState(() {
+        _isFlashOn = !_isFlashOn;
+      });
+    } catch (e) {
+      debugPrint("Error toggling flash: $e");
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
+    final size = MediaQuery.of(context).size;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'Phone Scanner AI',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-        centerTitle: true,
-      ),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(20.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // Image Preview Area
-              Expanded(
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: colorScheme.surfaceContainerHighest.withOpacity(0.4),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                      color: colorScheme.outline.withOpacity(0.2),
-                      width: 1.5,
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          // 1. Live Camera Preview
+          if (_isCameraInitialized && _cameraController != null)
+            SizedBox.expand(
+              child: CameraPreview(_cameraController!),
+            )
+          else
+            const Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(color: Color(0xFF6366F1)),
+                  SizedBox(height: 16),
+                  Text(
+                    'Initializing Live Camera...',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                ],
+              ),
+            ),
+
+          // 2. Google Lens Style Bounding Box Overlay
+          Center(
+            child: Container(
+              width: size.width * 0.85,
+              height: 160,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: _detectedPhoneNumber != null
+                      ? Colors.greenAccent
+                      : const Color(0xFF6366F1),
+                  width: 3.0,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: (_detectedPhoneNumber != null
+                            ? Colors.greenAccent
+                            : const Color(0xFF6366F1))
+                        .withOpacity(0.3),
+                    blurRadius: 20,
+                    spreadRadius: 2,
+                  ),
+                ],
+              ),
+              child: Stack(
+                children: [
+                  // Corner accent indicators
+                  Positioned(
+                    top: 12,
+                    left: 16,
+                    child: Text(
+                      _detectedPhoneNumber != null
+                          ? 'NUMBER DETECTED'
+                          : 'ALIGN PHONE NUMBER HERE',
+                      style: TextStyle(
+                        color: _detectedPhoneNumber != null
+                            ? Colors.greenAccent
+                            : Colors.white70,
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.2,
+                      ),
                     ),
                   ),
-                  clipBehavior: Clip.antiAlias,
-                  child: Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      if (_selectedImage != null)
-                        Image.file(
-                          _selectedImage!,
-                          fit: BoxFit.contain,
-                          width: double.infinity,
-                          height: double.infinity,
-                        )
-                      else
-                        Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              Icons.center_focus_weak_rounded,
-                              size: 72,
-                              color: colorScheme.primary.withOpacity(0.5),
-                            ),
-                            const SizedBox(height: 16),
-                            Text(
-                              'Select an image to scan for phone numbers',
-                              style: theme.textTheme.titleMedium?.copyWith(
-                                color: colorScheme.onSurfaceVariant,
-                              ),
-                              textAlign: TextAlign.center,
-                            ),
-                          ],
+                  if (_detectedPhoneNumber != null)
+                    Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 8,
                         ),
-
-                      // Loading Overlay during ML Kit OCR & Firestore Upload
-                      if (_isProcessing)
-                        Container(
-                          color: Colors.black.withOpacity(0.6),
-                          child: Center(
-                            child: Card(
-                              elevation: 8,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(16),
-                              ),
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 24.0,
-                                  vertical: 20.0,
-                                ),
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    CircularProgressIndicator(
-                                      color: colorScheme.primary,
-                                    ),
-                                    const SizedBox(height: 16),
-                                    const Text(
-                                      'Processing image and saving to database...',
-                                      style: TextStyle(
-                                        fontWeight: FontWeight.w600,
-                                      ),
-                                      textAlign: TextAlign.center,
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.85),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          _detectedPhoneNumber!,
+                          style: const TextStyle(
+                            color: Colors.greenAccent,
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
-                    ],
-                  ),
-                ),
-              ),
-
-              const SizedBox(height: 16),
-
-              // Detected Number Banner
-              if (_detectedPhoneNumber != null)
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  margin: const EdgeInsets.only(bottom: 16),
-                  decoration: BoxDecoration(
-                    color: colorScheme.primaryContainer,
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        Icons.phone_in_talk_rounded,
-                        color: colorScheme.onPrimaryContainer,
-                        size: 28,
-                      ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Scanned & Saved Number',
-                              style: theme.textTheme.labelMedium?.copyWith(
-                                color: colorScheme.onPrimaryContainer
-                                    .withOpacity(0.8),
-                              ),
-                            ),
-                            Text(
-                              _detectedPhoneNumber!,
-                              style: theme.textTheme.titleLarge?.copyWith(
-                                color: colorScheme.onPrimaryContainer,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      IconButton.filledTonal(
-                        onPressed: () => _openDialer(_detectedPhoneNumber!),
-                        icon: const Icon(Icons.call),
-                        tooltip: 'Open Dialer',
-                      ),
-                    ],
-                  ),
-                ),
-
-              // Action Buttons
-              Row(
-                children: [
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      onPressed: _isProcessing
-                          ? null
-                          : () => _pickAndProcessImage(ImageSource.camera),
-                      icon: const Icon(Icons.camera_alt_rounded),
-                      label: const Text('Scan via Camera'),
-                      style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                        backgroundColor: colorScheme.primary,
-                        foregroundColor: colorScheme.onPrimary,
-                        elevation: 2,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        textStyle: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.bold,
-                        ),
                       ),
                     ),
+                ],
+              ),
+            ),
+          ),
+
+          // 3. Top Control Bar (Flashlight & Header)
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.6),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(
+                          Icons.camera_alt_rounded,
+                          color: Color(0xFF6366F1),
+                          size: 18,
+                        ),
+                        SizedBox(width: 8),
+                        Text(
+                          'Google Lens AI Scanner',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: _isProcessing
-                          ? null
-                          : () => _pickAndProcessImage(ImageSource.gallery),
-                      icon: const Icon(Icons.photo_library_rounded),
-                      label: const Text('Upload Gallery'),
-                      style: OutlinedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                        foregroundColor: colorScheme.primary,
-                        side: BorderSide(color: colorScheme.primary, width: 1.5),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        textStyle: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
+                  IconButton(
+                    style: IconButton.styleFrom(
+                      backgroundColor: Colors.black.withOpacity(0.6),
+                    ),
+                    onPressed: _toggleFlash,
+                    icon: Icon(
+                      _isFlashOn ? Icons.flash_on : Icons.flash_off,
+                      color: _isFlashOn ? Colors.yellowAccent : Colors.white,
                     ),
                   ),
                 ],
               ),
-            ],
+            ),
           ),
-        ),
+
+          // 4. Bottom Control Bar (Gallery Fallback & Rescan Button)
+          Positioned(
+            bottom: 30,
+            left: 20,
+            right: 20,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_isLocked)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12.0),
+                    child: ElevatedButton.icon(
+                      onPressed: _resetScanner,
+                      icon: const Icon(Icons.refresh_rounded),
+                      label: const Text('Scan Another Number'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF6366F1),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 24,
+                          vertical: 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                      ),
+                    ),
+                  ),
+
+                Row(
+                  children: [
+                    // Fallback Upload from Gallery
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _pickFromGallery,
+                        icon: const Icon(Icons.photo_library_rounded),
+                        label: const Text('Upload from Gallery'),
+                        style: OutlinedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          foregroundColor: Colors.white,
+                          backgroundColor: Colors.black.withOpacity(0.6),
+                          side: const BorderSide(
+                            color: Colors.white38,
+                            width: 1.5,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          textStyle: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
