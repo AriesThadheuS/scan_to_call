@@ -36,6 +36,80 @@ Camera starts live scanning (every 300ms)
 
 ---
 
+## 📥 APK Downloads & Device Support
+
+> **Don't know which APK to download?**  
+> Most modern Android phones (released after 2019) → use **arm64-v8a**.
+
+### 🔽 Direct Download
+
+| Device Type | Architecture | Size | Download |
+|-------------|-------------|------|----------|
+| 📱 **New Phones** (2019+) — Samsung, OnePlus, Pixel, Redmi, Realme | `arm64-v8a` (64-bit) | ~31 MB | [📥 Download APK](https://github.com/AriesThadheuS/phone-number-scanner/releases/latest/download/Scan_to_Call-arm64.apk) |
+| 📱 **Old / Budget Phones** (pre-2019, entry-level) | `armeabi-v7a` (32-bit) | ~24 MB | [📥 Download APK](https://github.com/AriesThadheuS/phone-number-scanner/releases/latest/download/Scan_to_Call-arm32.apk) |
+| 💻 **Android Emulator / x86 Tablet** | `x86_64` | ~33 MB | [📥 Download APK](https://github.com/AriesThadheuS/phone-number-scanner/releases/latest/download/Scan_to_Call-x86_64.apk) |
+
+> 🔗 All releases: [github.com/AriesThadheuS/phone-number-scanner/releases](https://github.com/AriesThadheuS/phone-number-scanner/releases)
+
+---
+
+### 🤔 How to Find Your Phone's Architecture
+
+**Method 1 — Settings:**
+> Settings → About Phone → Processor / CPU info  
+> Look for: `ARM64` / `AArch64` → download **arm64-v8a**  
+> Look for: `ARM` / `ARMv7` → download **armeabi-v7a**
+
+**Method 2 — Quick Rule:**
+> Bought your phone **after 2018**? → Download **arm64-v8a** ✅  
+> Using an **Android emulator** on PC/Mac? → Download **x86_64** ✅
+
+---
+
+### 📲 Step-by-Step Installation Guide
+
+> ⚠️ Since this APK is not from the Play Store, you need to allow installation from unknown sources.
+
+**Step 1 — Allow Unknown Sources**
+```
+Android 8.0+ (Oreo and above):
+Settings → Apps → Special App Access → Install Unknown Apps
+→ Select your browser/file manager → Toggle ON "Allow from this source"
+
+Android 7.0 and below:
+Settings → Security → Unknown Sources → Toggle ON
+```
+
+**Step 2 — Download the APK**
+- Tap the correct **📥 Download APK** button above for your device
+- The APK file will download to your `Downloads` folder
+
+**Step 3 — Install**
+- Open your `Downloads` folder (use Files / My Files app)
+- Tap `Scan_to_Call-arm64.apk` (or whichever you downloaded)
+- Tap **Install** → wait a few seconds
+
+**Step 4 — Grant Permissions**
+- On first launch, the app will ask for:
+  - 📷 **Camera** — required for live scanning
+  - 📞 **Phone** — required to open the dialer
+
+**Step 5 — Start Scanning!**
+- Open the app
+- Point camera at any phone number on a business card, banner, or screen
+- Tap **"Call XXXXXXXXXX"** → your native dialer opens instantly 🎉
+
+---
+
+### 🔒 Is It Safe?
+
+- ✅ **100% Offline** — No internet connection used
+- ✅ **No data sent anywhere** — All data stored locally (SQLite)
+- ✅ **Open source** — Full source code available on GitHub
+- ✅ **No ads, no tracking, no analytics**
+
+---
+
 ## 🗂️ Project Structure
 
 ```
@@ -72,10 +146,10 @@ dependencies:
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Build From Source
 
 ### Prerequisites
-- Flutter SDK ≥ 3.0.0
+- Flutter SDK >= 3.0.0
 - Android Studio / JDK 17+
 - Android device with camera
 
@@ -89,7 +163,7 @@ flutter run
 
 ### Build Release APK (Recommended: Split per ABI)
 ```bash
-# Slim per-architecture APKs (~25–31 MB each)
+# Slim per-architecture APKs (~25-31 MB each)
 flutter build apk --release --split-per-abi --no-tree-shake-icons
 
 # Fat universal APK (~74 MB, all architectures)
@@ -99,9 +173,9 @@ flutter build apk --release --no-tree-shake-icons
 ### Output APKs
 ```
 build/app/outputs/flutter-apk/
-├── app-arm64-v8a-release.apk   → Modern phones (2019+)
-├── app-armeabi-v7a-release.apk → Older/budget phones
-└── app-x86_64-release.apk      → Emulators
+├── app-arm64-v8a-release.apk   → Modern phones (2019+)   ~31 MB
+├── app-armeabi-v7a-release.apk → Older/budget phones      ~24 MB
+└── app-x86_64-release.apk      → Emulators                ~33 MB
 ```
 
 ---
@@ -161,7 +235,7 @@ Future<void> _showMultipleNumbersBottomSheet(List<String> numbers)
 1. International format: `+91 9876543210`
 2. Zero-lead Indian: `09876543210`
 3. Standard 10-digit Indian: `[6-9]XXXXXXXXX`
-4. Generic 10–15 digit fallback
+4. Generic 10-15 digit fallback
 
 ---
 
@@ -177,16 +251,16 @@ Future<void> _showMultipleNumbersBottomSheet(List<String> numbers)
 ## 📝 Changelog
 
 ### v1.0.0 — 10 September 2026
-- ✅ App renamed to **Scan to Call**
-- ✅ Custom green scanner launcher icon (all density buckets)
-- ✅ Code minification + resource shrinking (ProGuard/R8)
-- ✅ Split-per-ABI APKs: 74 MB → ~25–31 MB
-- ✅ Frame stabilization (700ms debounce)
-- ✅ Gallery button position fixed (above gesture bar)
-- ✅ Multi-number extraction engine (`Set<String>` deduplication)
-- ✅ Modal bottom sheet number picker (dark glassmorphic UI)
-- ✅ Anti-flicker 1.5s cooldown after modal dismiss
-- ✅ SQLite source tagging: `'camera'`, `'gallery'`, `'camera_multi'`
+- App renamed to **Scan to Call**
+- Custom green scanner launcher icon (all density buckets)
+- Code minification + resource shrinking (ProGuard/R8)
+- Split-per-ABI APKs: 74 MB → ~25-31 MB
+- Frame stabilization (700ms debounce)
+- Gallery button position fixed (above gesture bar)
+- Multi-number extraction engine (Set deduplication)
+- Modal bottom sheet number picker (dark glassmorphic UI)
+- Anti-flicker 1.5s cooldown after modal dismiss
+- SQLite source tagging: `camera`, `gallery`, `camera_multi`
 
 ---
 
