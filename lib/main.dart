@@ -78,7 +78,7 @@ class PhoneExtractorApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Google Lens Style Live Scanner',
+      title: 'Scan to Call',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -111,6 +111,11 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
   String? _detectedPhoneNumber;
   String? _lastAutoSavedNumber;
   bool _isFlashOn = false;
+  int _lastValidDetectionTimestamp = 0;
+  static const int _stabilizationHoldMs = 700; // Hold recognized number for 700ms to prevent jitter/shake clearing
+
+  bool _isBottomSheetOpen = false;
+  int _modalDismissCooldownUntil = 0;
 
   final ImagePicker _imagePicker = ImagePicker();
   final TextRecognizer _textRecognizer = TextRecognizer(
@@ -238,6 +243,12 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     if (_cameraController == null) return;
 
     final int now = DateTime.now().millisecondsSinceEpoch;
+
+    // Skip frame processing if modal bottom sheet is open or in anti-flicker cooldown
+    if (_isBottomSheetOpen || now < _modalDismissCooldownUntil) {
+      return;
+    }
+
     // Process 1 frame every 300ms to maintain smooth 60 FPS performance without lag
     if (now - _lastFrameProcessedTimestamp < 300) {
       return;
@@ -261,21 +272,29 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
       final RecognizedText recognizedText =
           await _textRecognizer.processImage(inputImage);
 
-      final String? foundPhoneNumber = _extractPhoneNumber(recognizedText.text);
+      final List<String> detectedNumbers =
+          _extractAllPhoneNumbers(recognizedText.text);
 
       if (!mounted) return;
 
-      if (foundPhoneNumber != null && foundPhoneNumber.isNotEmpty) {
-        // Number detected in current frame -> Update state & highlight green
+      if (detectedNumbers.length > 1) {
+        // Case B: Multiple numbers detected -> Show bottom sheet selector
+        debugPrint('[MULTI DETECT] Found ${detectedNumbers.length} numbers: $detectedNumbers');
+        _showMultipleNumbersBottomSheet(detectedNumbers);
+      } else if (detectedNumbers.length == 1) {
+        // Case A: Single number detected -> Update state & highlight green
+        final String foundPhoneNumber = detectedNumbers.first;
+        _lastValidDetectionTimestamp = now;
+
         if (_detectedPhoneNumber != foundPhoneNumber) {
           HapticFeedback.selectionClick();
           debugPrint("REALTIME TRACKING: Phone number detected '$foundPhoneNumber'");
         }
 
-        // Lock camera detection tracker for this number
         if (foundPhoneNumber != _lastAutoSavedNumber) {
           _lastAutoSavedNumber = foundPhoneNumber;
-          final String cleanNum = foundPhoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
+          final String cleanNum =
+              foundPhoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
           debugPrint('[CAMERA DETECT] Number tracked: $cleanNum');
         }
 
@@ -283,13 +302,21 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
           _detectedPhoneNumber = foundPhoneNumber;
         });
       } else {
-        // Camera moved away / NO number in current frame -> Clear state & reset auto-save tracker
-        if (_detectedPhoneNumber != null || _lastAutoSavedNumber != null) {
-          debugPrint("REALTIME TRACKING: Number left camera view -> clearing frame & reset auto-save tracker");
-          _lastAutoSavedNumber = null;
-          setState(() {
-            _detectedPhoneNumber = null;
-          });
+        // Frame stabilization / Debounce: Hold last valid number for 700ms to avoid flicker/jitter during hand movement
+        if (_detectedPhoneNumber != null &&
+            (now - _lastValidDetectionTimestamp < _stabilizationHoldMs)) {
+          debugPrint(
+              "STABILIZATION: Frame missed number, maintaining state (${now - _lastValidDetectionTimestamp}ms / ${_stabilizationHoldMs}ms)");
+        } else {
+          // Camera moved away / beyond hold duration -> Clear state & reset auto-save tracker
+          if (_detectedPhoneNumber != null || _lastAutoSavedNumber != null) {
+            debugPrint(
+                "REALTIME TRACKING: Number left camera view -> clearing frame & reset auto-save tracker");
+            _lastAutoSavedNumber = null;
+            setState(() {
+              _detectedPhoneNumber = null;
+            });
+          }
         }
       }
     } catch (e) {
@@ -299,105 +326,249 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     }
   }
 
-  /// Robust Phone Number Parser:
-  /// Prevents truncation (e.g., +91 9876543210 -> +919876543210 intact, not 543210).
-  /// Preserves country codes (+91), leading 0s, and complete 10-digit Indian numbers [6-9]XXXXX.
-  String? _extractPhoneNumber(String text) {
-    if (text.isEmpty) return null;
+  /// Multi-Number Extraction Engine:
+  /// Extracts ALL unique valid 10-15 digit phone numbers detected within text.
+  List<String> _extractAllPhoneNumbers(String text) {
+    if (text.isEmpty) return [];
 
-    // 1. Split into lines to evaluate individual line entries
+    final Set<String> results = {};
     final List<String> rawLines = text.split(RegExp(r'[\r\n]+'));
 
-    // Regex for International format starting with '+'
-    // Matches '+' followed by digits, spaces, hyphens, parentheses, or dots
     final RegExp intlPattern = RegExp(r'\+\d[\d\s\-\.\(\)]{8,20}');
-
-    // Regex for 11-digit zero-leading numbers starting with 0 then [6-9]
     final RegExp zeroIndianPattern = RegExp(r'(?<!\d)0[\s\.-]?[6-9]\d{4}[\s\.-]?\d{5}(?!\d)');
-
-    // Regex for 10-digit Indian numbers starting with [6-9]
     final RegExp indianPattern = RegExp(r'(?<!\d)[6-9]\d{4}[\s\.-]?\d{5}(?!\d)');
-
-    // Regex for generic contiguous or spaced digit sequences (10-15 digits)
     final RegExp genericPattern = RegExp(r'(?<!\d)\+?\d[\d\s\-\.]{8,20}\d(?!\d)');
 
     for (final line in rawLines) {
       final String trimmedLine = line.trim();
       if (trimmedLine.isEmpty) continue;
 
-      // Check 1: International format starting with '+' e.g. +91 98765 43210 or +91-9876543210
       for (final Match m in intlPattern.allMatches(trimmedLine)) {
         final String rawMatch = m.group(0)!;
         final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
         final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
         if (digitsOnly.length >= 10 && digitsOnly.length <= 15 && clean.startsWith('+')) {
-          return clean;
+          results.add(clean);
         }
       }
 
-      // Check 2: Zero-leading Indian numbers e.g. 09876543210 or 0 98765 43210
       for (final Match m in zeroIndianPattern.allMatches(trimmedLine)) {
         final String rawMatch = m.group(0)!;
         final String clean = rawMatch.replaceAll(RegExp(r'[^\d]'), '');
         if (clean.length == 11 && clean.startsWith('0')) {
-          return clean;
+          results.add(clean);
         }
       }
 
-      // Check 3: Standard 10-digit Indian numbers starting with [6-9]
       for (final Match m in indianPattern.allMatches(trimmedLine)) {
         final String rawMatch = m.group(0)!;
         final String clean = rawMatch.replaceAll(RegExp(r'[^\d]'), '');
         if (clean.length == 10 && RegExp(r'^[6-9]').hasMatch(clean)) {
-          return clean;
+          results.add(clean);
         }
       }
 
-      // Check 4: Generic pattern within the line
       for (final Match m in genericPattern.allMatches(trimmedLine)) {
         final String rawMatch = m.group(0)!;
         final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
         final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
         if (digitsOnly.length >= 10 && digitsOnly.length <= 15) {
-          return clean;
+          results.add(clean);
         }
       }
     }
 
-    // 2. Global Fallback across whole text (handles multi-line splits from ML Kit)
-    final String sanitized = text.replaceAll(RegExp(r'[^\d+\s\-]'), ' ');
+    if (results.isEmpty) {
+      final String sanitized = text.replaceAll(RegExp(r'[^\d+\s\-]'), ' ');
 
-    // Check for + international format globally
-    for (final Match m in intlPattern.allMatches(sanitized)) {
-      final String rawMatch = m.group(0)!;
-      final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
-      final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
-      if (digitsOnly.length >= 10 && digitsOnly.length <= 15 && clean.startsWith('+')) {
-        return clean;
+      for (final Match m in intlPattern.allMatches(sanitized)) {
+        final String rawMatch = m.group(0)!;
+        final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
+        final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
+        if (digitsOnly.length >= 10 && digitsOnly.length <= 15 && clean.startsWith('+')) {
+          results.add(clean);
+        }
+      }
+
+      final String allDigits = text.replaceAll(RegExp(r'[^\d]'), '');
+
+      for (final Match m in RegExp(r'0[6-9]\d{9}').allMatches(allDigits)) {
+        results.add(m.group(0)!);
+      }
+
+      for (final Match m in RegExp(r'[6-9]\d{9}').allMatches(allDigits)) {
+        results.add(m.group(0)!);
+      }
+
+      if (results.isEmpty && allDigits.length >= 10 && allDigits.length <= 15) {
+        results.add(allDigits);
       }
     }
 
-    // Global digits-only extraction
-    final String allDigits = text.replaceAll(RegExp(r'[^\d]'), '');
+    return results.toList();
+  }
 
-    // 11-digit starting with 0 and [6-9]
-    final Match? zeroMatch = RegExp(r'0[6-9]\d{9}').firstMatch(allDigits);
-    if (zeroMatch != null) {
-      return zeroMatch.group(0);
-    }
+  /// Single number convenience wrapper
+  String? _extractPhoneNumber(String text) {
+    final list = _extractAllPhoneNumbers(text);
+    return list.isNotEmpty ? list.first : null;
+  }
 
-    // 10-digit starting with [6-9]
-    final Match? indianMatch = RegExp(r'[6-9]\d{9}').firstMatch(allDigits);
-    if (indianMatch != null) {
-      return indianMatch.group(0);
-    }
+  /// Displays modern modal bottom sheet when multiple phone numbers are detected
+  Future<void> _showMultipleNumbersBottomSheet(List<String> numbers) async {
+    if (!mounted || _isBottomSheetOpen) return;
+    _isBottomSheetOpen = true;
 
-    // 10-15 digit fallback sequence
-    if (allDigits.length >= 10 && allDigits.length <= 15) {
-      return allDigits;
-    }
+    HapticFeedback.heavyImpact();
 
-    return null;
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1E1E2E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (BuildContext ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Top drag bar indicator
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+
+                // Sheet Title Header
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.greenAccent.withValues(alpha: 0.15),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.filter_center_focus_rounded,
+                        color: Colors.greenAccent,
+                        size: 22,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Multiple Numbers Detected',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          Text(
+                            'Select which number to call:',
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.6),
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+
+                // Number List Items
+                Flexible(
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: numbers.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 10),
+                    itemBuilder: (context, index) {
+                      final String numStr = numbers[index];
+                      return Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: () {
+                            Navigator.pop(ctx);
+                            _handleDetectedNumber(numStr, 'camera_multi');
+                          },
+                          borderRadius: BorderRadius.circular(16),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 14,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF2A2A3C),
+                              borderRadius: BorderRadius.circular(16),
+                              border: Border.all(
+                                color: Colors.greenAccent.withValues(alpha: 0.35),
+                                width: 1.2,
+                              ),
+                            ),
+                            child: Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(10),
+                                  decoration: BoxDecoration(
+                                    color: Colors.green.shade600,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: const Icon(
+                                    Icons.phone_in_talk_rounded,
+                                    color: Colors.white,
+                                    size: 18,
+                                  ),
+                                ),
+                                const SizedBox(width: 14),
+                                Expanded(
+                                  child: Text(
+                                    numStr,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                      letterSpacing: 1.0,
+                                    ),
+                                  ),
+                                ),
+                                const Icon(
+                                  Icons.chevron_right_rounded,
+                                  color: Colors.white54,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    _isBottomSheetOpen = false;
+    // Set 1.5s anti-flicker cooldown after modal close to allow camera repositioning
+    _modalDismissCooldownUntil = DateTime.now().millisecondsSinceEpoch + 1500;
   }
 
   /// Offline Call / Save handler:
@@ -784,7 +955,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                         ),
                         SizedBox(width: 8),
                         Text(
-                          'Real-Time Lens Scanner',
+                          'Scan to Call',
                           style: TextStyle(
                             color: Colors.white,
                             fontWeight: FontWeight.bold,
@@ -809,37 +980,39 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
             ),
           ),
 
-          // 4. Bottom Control Bar (Upload from Gallery)
+          // 4. Bottom Control Bar (Upload from Gallery) — Lifted above gesture bar
           Positioned(
-            bottom: 30,
+            bottom: 50,
             left: 20,
             right: 20,
-            child: Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _pickFromGallery,
-                    icon: const Icon(Icons.photo_library_rounded),
-                    label: const Text('Upload from Gallery'),
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                      foregroundColor: Colors.white,
-                      backgroundColor: Colors.black.withValues(alpha: 0.6),
-                      side: const BorderSide(
-                        color: Colors.white38,
-                        width: 1.5,
-                      ),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      textStyle: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.bold,
+            child: SafeArea(
+              child: Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _pickFromGallery,
+                      icon: const Icon(Icons.photo_library_rounded),
+                      label: const Text('Upload from Gallery'),
+                      style: OutlinedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        foregroundColor: Colors.white,
+                        backgroundColor: Colors.black.withValues(alpha: 0.75),
+                        side: const BorderSide(
+                          color: Colors.white54,
+                          width: 1.5,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        textStyle: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ],

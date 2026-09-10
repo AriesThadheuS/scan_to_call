@@ -30,7 +30,23 @@ android {
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+
+    applicationVariants.all {
+        outputs.all {
+            val output = this as? com.android.build.gradle.internal.api.BaseVariantOutputImpl
+            if (output != null) {
+                val abi = output.getFilter(com.android.build.OutputFile.ABI)
+                if (abi != null) {
+                    output.outputFileName = "Scan_to_Call-$abi.apk"
+                } else {
+                    output.outputFileName = "Scan_to_Call.apk"
+                }
+            }
         }
     }
 }
