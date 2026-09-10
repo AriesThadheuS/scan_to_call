@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -6,13 +7,9 @@ import 'package:camera/camera.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
-
-import 'firebase_options.dart';
 
 // ---------------------------------------------------------------------------
 // DatabaseHelper — Offline SQLite call log
@@ -67,15 +64,6 @@ List<CameraDescription> _cameras = [];
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   try {
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-    );
-    debugPrint("Firebase initialized successfully.");
-  } catch (e) {
-    debugPrint("Firebase initialization info/error: $e");
-  }
-
-  try {
     _cameras = await availableCameras();
   } catch (e) {
     debugPrint("Failed to get available cameras: $e");
@@ -121,6 +109,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
   bool _isProcessingFrame = false;
   int _lastFrameProcessedTimestamp = 0;
   String? _detectedPhoneNumber;
+  String? _lastAutoSavedNumber;
   bool _isFlashOn = false;
 
   final ImagePicker _imagePicker = ImagePicker();
@@ -283,13 +272,21 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
           debugPrint("REALTIME TRACKING: Phone number detected '$foundPhoneNumber'");
         }
 
+        // Lock camera detection tracker for this number
+        if (foundPhoneNumber != _lastAutoSavedNumber) {
+          _lastAutoSavedNumber = foundPhoneNumber;
+          final String cleanNum = foundPhoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
+          debugPrint('[CAMERA DETECT] Number tracked: $cleanNum');
+        }
+
         setState(() {
           _detectedPhoneNumber = foundPhoneNumber;
         });
       } else {
-        // Camera moved away / NO number in current frame -> Clear state immediately
-        if (_detectedPhoneNumber != null) {
-          debugPrint("REALTIME TRACKING: Number left camera view -> clearing frame");
+        // Camera moved away / NO number in current frame -> Clear state & reset auto-save tracker
+        if (_detectedPhoneNumber != null || _lastAutoSavedNumber != null) {
+          debugPrint("REALTIME TRACKING: Number left camera view -> clearing frame & reset auto-save tracker");
+          _lastAutoSavedNumber = null;
           setState(() {
             _detectedPhoneNumber = null;
           });
@@ -403,94 +400,43 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     return null;
   }
 
-  /// Full robust Call Button handler:
-  /// 1. Saves to Firestore (non-blocking on failure)
-  /// 2. Checks CALL_PHONE permission safely
-  /// 3. Non-blocking SQLite offline log via Future.microtask
-  /// 4. Launches native dialer with exhaustive debugPrint tracing
+  /// Offline Call / Save handler:
+  /// 1. Sanitizes phone number.
+  /// 2. Non-blocking SQLite call logging.
+  /// 3. ZERO delay permission check & native dialer launch.
   Future<void> _handleDetectedNumber(String phoneNumber, String source) async {
     debugPrint('======================================================');
-    debugPrint('[CALL FLOW] START — number: $phoneNumber | source: $source');
+    debugPrint('[SAVE & CALL] START — number: $phoneNumber | source: $source');
     debugPrint('======================================================');
 
     // ── STEP 1: Sanitize immediately ──────────────────────────────────────────
     final String sanitized = phoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
     final String digitsOnly = sanitized.replaceAll('+', '');
-    debugPrint('[CALL FLOW] Step 1 — Sanitized: "$sanitized" | Digits: ${digitsOnly.length}');
+    debugPrint('[SAVE & CALL] Step 1 — Sanitized: "$sanitized" | Digits: ${digitsOnly.length}');
 
     if (digitsOnly.length < 10 || digitsOnly.length > 15) {
-      debugPrint('[CALL FLOW] ABORT — Invalid digit count: ${digitsOnly.length}');
+      debugPrint('[SAVE & CALL] ABORT — Invalid digit count: ${digitsOnly.length}');
       return;
     }
 
-    // ── STEP 2: Non-blocking Firestore write (never blocks dialer) ────────────
-    Future.microtask(() async {
-      debugPrint('[FIRESTORE] Writing to scanned_numbers...');
-      try {
-        final DocumentReference docRef = await FirebaseFirestore.instance
-            .collection('scanned_numbers')
-            .add({
-          'phoneNumber': sanitized,
-          'createdAt': FieldValue.serverTimestamp(),
-          'source': source,
-        });
-        debugPrint('[FIRESTORE] SUCCESS — Doc ID: ${docRef.id}');
-      } catch (e) {
-        debugPrint('[FIRESTORE] ERROR (non-fatal): $e');
-      }
-    });
-
-    // ── STEP 3: Non-blocking SQLite offline log (DatabaseHelper) ─────────────
-    // Wrapped in Future.microtask so DB errors NEVER block or crash the dialer.
+    // ── STEP 2: Non-blocking SQLite offline log ──────────────────────────────
     Future.microtask(() => DatabaseHelper.logCall(sanitized, source));
 
-    // ── STEP 4: Permission check for CALL_PHONE ───────────────────────────────
-    // NOTE: Opening the dialer pad (tel:) does NOT require CALL_PHONE permission.
-    // Only android.intent.action.CALL (direct call without user prompt) needs it.
-    // We check it anyway; on denial we still proceed to open the dialer pad safely.
-    debugPrint('[CALL FLOW] Step 4 — Checking Permission.phone...');
-    PermissionStatus phonePermStatus;
+    // ── STEP 3: Permission check for CALL_PHONE ───────────────────────────────
+    debugPrint('[SAVE & CALL] Step 3 — Checking Permission.phone...');
     try {
-      phonePermStatus = await Permission.phone.status;
-      debugPrint('[PERMISSION] Current status: $phonePermStatus');
-
+      final PermissionStatus phonePermStatus = await Permission.phone.status;
       if (phonePermStatus.isDenied) {
-        phonePermStatus = await Permission.phone.request();
-        debugPrint('[PERMISSION] After request: $phonePermStatus');
-      }
-
-      if (phonePermStatus.isPermanentlyDenied) {
-        debugPrint('[PERMISSION] Permanently denied — opening app settings nudge');
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text(
-                'Phone permission denied. Opening dialer pad instead.',
-                style: TextStyle(fontWeight: FontWeight.w500),
-              ),
-              backgroundColor: Colors.orange.shade800,
-              action: const SnackBarAction(
-                label: 'Settings',
-                textColor: Colors.white,
-                onPressed: openAppSettings,
-              ),
-              behavior: SnackBarBehavior.floating,
-              margin: const EdgeInsets.all(16),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            ),
-          );
-        }
-        // Fallback: still open dialer pad (tel: only shows pad, no CALL_PHONE needed)
+        await Permission.phone.request();
       }
     } catch (e) {
-      // permission_handler can throw on desktop/unsupported — treat as granted, proceed
       debugPrint('[PERMISSION] Exception (non-fatal, proceeding): $e');
     }
 
-    // ── STEP 5: Launch native dialer ──────────────────────────────────────────
+    // ── STEP 4: Launch native dialer ──────────────────────────────────────────
     await _openDialer(sanitized);
 
-    debugPrint('[CALL FLOW] END — dialer launch attempted for $sanitized');
+    debugPrint('[SAVE & CALL] END — Completed flow for $sanitized');
     debugPrint('======================================================');
   }
 
@@ -780,7 +726,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                       child: ElevatedButton.icon(
                         onPressed: () => _handleDetectedNumber(
                           _detectedPhoneNumber!,
-                          'live_camera',
+                          'dialer',
                         ),
                         icon: const Icon(
                           Icons.phone_in_talk_rounded,
