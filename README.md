@@ -1,32 +1,27 @@
-Scan to Call App
-Welcome to the official repository for the Scan to Call application. This is a super fast and completely offline mobile application built with Flutter. It lets you point your camera at any physical document or screen, instantly recognize phone numbers, and call them without typing a single digit.
+Scan to Call Application
+Welcome to the official repository for the Scan to Call project. This is an incredibly fast and completely offline mobile application built using the Flutter framework. It allows users to point their device camera at any physical document or digital screen, instantly recognize phone numbers, and dial them without typing a single digit.
 
-What makes this app special
+Key Architecture and Features
+Strictly Offline Processing: We prioritize user privacy and data security. The application operates entirely on the device without making any network requests or connecting to cloud databases.
 
-Completely Offline: We value your privacy. The app does not connect to any external servers or cloud databases. Everything happens right on your device.
+Zero Latency Performance: By eliminating network dependencies, the camera feed processes frames instantly for real time tracking.
 
-Lightning Fast: By removing all internet delays, the camera tracks numbers instantly.
+Intelligent Multi Number Parsing: When the optical character recognition engine detects multiple phone numbers simultaneously on a surface like a business card, the scanning stream pauses. It then presents a user friendly selection menu allowing exact dialing control.
 
-Smart Detection: If there are multiple phone numbers on a business card or poster, the app pauses and shows you a clean list so you can choose exactly which one you want to dial.
+Asynchronous Local Storage: Every scanned and dialed number is saved locally to a secure SQLite database directly on the device memory.
 
-Local History: Every time you scan and call a number, it gets saved safely inside your phone memory.
+Highly Optimized Build Size: The application is compiled with specific architecture targeting, resulting in an exceptionally small footprint that consumes minimal storage space.
 
-Small Size: We built this app to be incredibly light so it will not eat up your phone storage.
+Installation Guide
+Navigate to the Releases tab on this repository page. You will find three distinct application packages optimized for different hardware architectures.
 
-How to download and install
+For modern devices manufactured after 2019, select the package labeled for arm64.
 
-Go to the Releases section on this GitHub page.
+For budget or older Android devices, select the package labeled for arm32.
 
-You will see three different application files.
+Once the download completes, tap the package to begin installation. You may need to enable installations from unknown sources within your device security settings.
 
-If you have a modern smartphone bought after 2019, download the file labeled for arm64.
+Launch the application, grant the necessary camera permissions, and begin scanning immediately.
 
-If you are using a budget or older phone, download the arm32 version.
-
-Once downloaded, tap the file to install it. You might need to allow installations from unknown sources in your phone settings.
-
-Open the app, grant the camera permissions, and start scanning!
-
-For Developers
-
-If you want to build this project yourself, clone this repository to your local machine. Make sure you have Flutter installed. Run the standard build command for Android to generate the files. The code is structured to be very easy to read and modify.
+Developer Setup and Contribution
+To build this project locally, clone the repository to your local machine environment. Ensure you have the latest stable version of the Flutter SDK installed. Run the standard Android build command to generate the release packages. The codebase follows a clean architecture pattern, making it highly readable and straightforward to modify or extend.
