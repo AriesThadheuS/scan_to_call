@@ -46,3 +46,4 @@ app.*.map.json
 
 # APK files
 *.apk
+!Scan_to_Call-*.apk
