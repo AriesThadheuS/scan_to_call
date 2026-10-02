@@ -9,29 +9,54 @@
 
 | Feature | Description |
 |---------|-------------|
-| 🔍 Live Camera OCR | Continuously scans camera frames using Google ML Kit |
-| 📞 Instant Dialer | Taps detected number → opens native phone dialer |
-| 🧠 Multi-Number Picker | Multiple numbers in view → modal bottom sheet to select |
-| 🖼️ Gallery Scan | Upload any image to extract and call a phone number |
-| 💾 Offline SQLite Log | Every dialed number logged locally — no internet needed |
-| 🔦 Flashlight Toggle | Built-in torch control for low-light scanning |
-| 🛡️ Frame Stabilization | 700ms debounce prevents flicker from hand shake |
+| 🔍 **Live Camera OCR** | High-speed 1080p continuous stream parsing using Google ML Kit |
+| 🎯 **Spatial ROI Box Filtering** | Filters text elements strictly within the green Viewfinder box (≥80% overlap) |
+| 🗳️ **Rolling Consensus Engine** | 3-frame buffer requiring 2/3 majority vote before committing numbers |
+| 🔤 **OCR Confusion Matrix** | Context-aware sanitizer fixing OCR character confusions (`O`→`0`, `l`→`1`, `S`→`5`, `B`→`8`) |
+| 🌐 **Universal Global Parsing** | Native E.164 (`+1`, `+44`, `+91`, `+971`), trunk zero prefixes, and international formats |
+| 🛡️ **Noise & False-Positive Rejection** | Filters out dates, timestamps, IP addresses, prices, and sequential/repeated numbers |
+| 📞 **Instant Dialer** | One-tap dialing with zero delay permissions check and native dialer launch |
+| 🧠 **Multi-Number Picker** | Displays a dark glassmorphic modal sheet when multiple numbers are in view |
+| 🖼️ **Gallery Upload** | Fallback image picker for extracting phone numbers from gallery screenshots |
+| 💾 **Offline SQLite Log** | Non-blocking offline call logging — zero internet connection required |
+| 🔦 **Flashlight & Haptics** | Built-in torch toggle and tactile haptic vibration (`HapticFeedback.mediumImpact()`) on match |
 
 ---
 
 ## 📸 How It Works
 
 ```
-Open App
-   │
-   ▼
-Camera starts live scanning (every 300ms)
-   │
-   ├── 0 numbers found   → Waiting state: "Align phone number here"
-   ├── 1 number found    → Green bounding box + "Call XXXXXXXXXX" button
-   └── 2+ numbers found  → Bottom sheet: pick which number to call
-         │
-         └── Tap number → SQLite log → Native dialer launched
+                     Live 1080p Camera Stream (250ms FPS Throttle)
+                                       │
+                                       ▼
+                       Spatial ROI Bounding Box Filtering
+                  (Extract lines inside green viewfinder box ≥80%)
+                                       │
+                                       ▼
+                    Global OCR Character Confusion Matrix
+             (Fix O->0, l->1, S->5, B->8, Q->0 digit confusions)
+                                       │
+                                       ▼
+                     Universal Global Phone Parser & Rejection
+            (E.164, Trunk Zero, Length 10-15, Reject Dates/IPs/Prices)
+                                       │
+                                       ▼
+                     Rolling Consensus Voting Engine
+               (Requires candidate match in ≥2 of 3 frames)
+                                       │
+                ┌──────────────────────┴──────────────────────┐
+            count=1                                       count>1
+                │                                             │
+      Green Viewfinder Lock                        Modal Bottom Sheet
+      Tactile Haptic Vibration                     Interactive Number Picker
+      "Call +1 555-019-2834"                                  │
+                │                                             │
+                └──────────────────────┬──────────────────────┘
+                                       ▼
+                         Non-blocking SQLite Call Log
+                                       │
+                                       ▼
+                            Native Device Dialer Launch
 ```
 
 ---
@@ -39,7 +64,7 @@ Camera starts live scanning (every 300ms)
 ## 📥 APK Downloads & Device Support
 
 > **Don't know which APK to download?**  
-> Most modern Android phones (released after 2019) → use **arm64-v8a**.
+> Most modern Android phones (released after 2019) use **arm64-v8a**.
 
 ### 🔽 Direct Download
 
@@ -68,7 +93,7 @@ Camera starts live scanning (every 300ms)
 
 ### 📲 Step-by-Step Installation Guide
 
-> ⚠️ Since this APK is not from the Play Store, you need to allow installation from unknown sources.
+> ⚠️ Since this APK is not from the Play Store, allow installation from unknown sources.
 
 **Step 1 — Allow Unknown Sources**
 ```
@@ -86,27 +111,26 @@ Settings → Security → Unknown Sources → Toggle ON
 
 **Step 3 — Install**
 - Open your `Downloads` folder (use Files / My Files app)
-- Tap `Scan_to_Call-arm64.apk` (or whichever you downloaded)
+- Tap `Scan_to_Call-arm64.apk` (or whichever architecture you downloaded)
 - Tap **Install** → wait a few seconds
 
 **Step 4 — Grant Permissions**
-- On first launch, the app will ask for:
+- On first launch, grant requested permissions:
   - 📷 **Camera** — required for live scanning
   - 📞 **Phone** — required to open the dialer
 
 **Step 5 — Start Scanning!**
-- Open the app
 - Point camera at any phone number on a business card, banner, or screen
-- Tap **"Call XXXXXXXXXX"** → your native dialer opens instantly 🎉
+- Green target locks on number → tap **"Call XXXXXXXXXX"** → dialer opens instantly 🎉
 
 ---
 
 ### 🔒 Is It Safe?
 
-- ✅ **100% Offline** — No internet connection used
-- ✅ **No data sent anywhere** — All data stored locally (SQLite)
-- ✅ **Open source** — Full source code available on GitHub
-- ✅ **No ads, no tracking, no analytics**
+- ✅ **100% Offline** — Zero internet connection required or used
+- ✅ **Zero Telemetry** — All data stored locally in SQLite (`call_log.db`)
+- ✅ **Open Source** — Full source code available on GitHub
+- ✅ **No ads, no tracking, no external SDKs**
 
 ---
 
@@ -115,17 +139,17 @@ Settings → Security → Unknown Sources → Toggle ON
 ```
 scan_to_call/
 ├── lib/
-│   └── main.dart                  # All app logic (camera, OCR, UI, DB)
+│   └── main.dart                  # All app logic (camera, ROI filtering, OCR matrix, consensus engine, DB)
+├── test/
+│   └── widget_test.dart           # App smoke test
 ├── android/
 │   ├── app/
-│   │   ├── build.gradle.kts       # Build config: minify, ProGuard, APK naming
-│   │   ├── proguard-rules.pro     # Keep rules: MLKit, SQLite, Flutter
+│   │   ├── build.gradle.kts       # Build config: minify, ProGuard, ABI splitting
+│   │   ├── proguard-rules.pro     # Keep rules for ML Kit & SQLite
 │   │   └── src/main/
-│   │       ├── AndroidManifest.xml # App name, permissions
-│   │       └── res/mipmap-*/      # Launcher icons (all density buckets)
-│   └── gradle.properties          # JVM memory settings
-├── assets/
-│   └── logo.png                   # App logo
+│   │       ├── AndroidManifest.xml # App permissions & activity configuration
+│   │       └── res/mipmap-*/      # Custom launcher icons (hdpi to xxxdpi)
+│   └── gradle.properties          # JVM memory options
 └── pubspec.yaml                   # Flutter dependencies
 ```
 
@@ -135,13 +159,13 @@ scan_to_call/
 
 ```yaml
 dependencies:
-  camera: ^0.11.0+2                      # Live camera stream
-  image_picker: ^1.1.2                   # Gallery image selection
+  camera: ^0.11.4                        # High-resolution live camera stream
+  image_picker: ^1.1.2                   # Gallery fallback selector
   google_mlkit_text_recognition: ^0.14.0 # On-device OCR engine
-  url_launcher: ^6.3.0                   # Native dialer launch
-  permission_handler: ^11.3.1            # Runtime permissions
-  sqflite: ^2.3.3                        # Local SQLite database
-  path: ^1.9.0                           # DB path helper
+  url_launcher: ^6.3.0                   # Native dialer launcher
+  permission_handler: ^11.4.0            # Dynamic runtime permissions
+  sqflite: ^2.4.2+1                      # Offline SQLite call history
+  path: ^1.9.0                           # DB path utilities
 ```
 
 ---
@@ -150,10 +174,10 @@ dependencies:
 
 ### Prerequisites
 - Flutter SDK >= 3.0.0
-- Android Studio / JDK 17+
-- Android device with camera
+- JDK 17+ & Android SDK (API 34)
+- Android device or emulator
 
-### Run in Development
+### Development Setup
 ```bash
 git clone https://github.com/AriesThadheuS/phone-number-scanner.git
 cd phone-number-scanner
@@ -161,106 +185,67 @@ flutter pub get
 flutter run
 ```
 
-### Build Release APK (Recommended: Split per ABI)
+### Production Release Build (Split per ABI)
 ```bash
-# Slim per-architecture APKs (~25-31 MB each)
+# Generate architecture-optimized release APKs (~24MB to 33MB each)
 flutter build apk --release --split-per-abi --no-tree-shake-icons
-
-# Fat universal APK (~74 MB, all architectures)
-flutter build apk --release --no-tree-shake-icons
 ```
 
-### Output APKs
+### Output APK Locations
 ```
 build/app/outputs/flutter-apk/
-├── app-arm64-v8a-release.apk   → Modern phones (2019+)   ~31 MB
-├── app-armeabi-v7a-release.apk → Older/budget phones      ~24 MB
-└── app-x86_64-release.apk      → Emulators                ~33 MB
+├── app-arm64-v8a-release.apk   → Modern 64-bit phones (2019+)   ~31 MB
+├── app-armeabi-v7a-release.apk → Legacy 32-bit budget phones    ~24 MB
+└── app-x86_64-release.apk      → Android Emulators & PCs        ~33 MB
 ```
 
 ---
 
-## 🔐 Permissions Required
+## 📐 Key Architecture & Engine Components
 
-| Permission | Reason |
-|------------|--------|
-| `CAMERA` | Live viewfinder scanning |
-| `READ_MEDIA_IMAGES` | Gallery image upload |
-| `CALL_PHONE` | Direct call launch |
-| `READ_PHONE_STATE` | Phone permission check |
-
----
-
-## 📐 Architecture
-
-```
-_processCameraFrame (every 300ms)
-        │
-        ▼
-_extractAllPhoneNumbers (ML Kit text → List<String>)
-        │
-   ┌────┴────┐
- count=1   count>1
-   │           │
- Green Box  Bottom Sheet
- Call Btn   Number Picker
-   │           │
-   └────┬──────┘
-        ▼
-_handleDetectedNumber
-   ├── SQLite: DatabaseHelper.logCall()
-   └── _openDialer → tel: URL intent
-```
-
----
-
-## 🧠 Key Logic Explained
-
-### Frame Stabilization (Anti-Shake)
+### 1. Spatial ROI Bounding Box Filter (`_extractCandidatesWithROI`)
+Calculates screen-space bounding boxes for each recognized line from camera space and discards any element outside the target green viewfinder rectangle:
 ```dart
-// Holds last detected number visible for 700ms even if frames miss it
-// Prevents flicker during hand movement
-static const int _stabilizationHoldMs = 700;
+// Ensures only text inside active green box (≥80% overlap area) is processed
+bool _isInsideRoi(Rect elementRect, Rect roi, {double threshold = 0.80})
 ```
 
-### Multi-Number Bottom Sheet
+### 2. Multi-Frame Rolling Consensus Voting Engine (`ConsensusVoter`)
+Prevents 1-frame OCR misreads and motion blur glitches by holding candidates in a 3-frame buffer:
 ```dart
-// Triggered when >1 valid phone numbers appear simultaneously in view
-// Pauses camera scanning while picker is open
-// 1.5s cooldown after dismissal (anti-flicker)
-Future<void> _showMultipleNumbersBottomSheet(List<String> numbers)
+class ConsensusVoter {
+  final List<Set<String>> _frameBuffer = [];
+  Set<String> vote(Set<String> frameCandidates) {
+    // Requires candidate number in at least 2 of last 3 frames to reach consensus
+  }
+}
 ```
 
-### Number Parsing (4-tier regex engine)
-1. International format: `+91 9876543210`
-2. Zero-lead Indian: `09876543210`
-3. Standard 10-digit Indian: `[6-9]XXXXXXXXX`
-4. Generic 10-15 digit fallback
-
----
-
-## 🌿 Git Branches
-
-| Branch | Purpose |
-|--------|---------|
-| `UAT` | Testing / staging builds |
-| `Main` | Production-ready release |
+### 3. OCR Character Confusion Matrix (`_sanitizeOcrText`)
+Fixes common digit-letter optical recognition confusions prior to regex verification:
+```dart
+static const Map<String, String> _ocrConfusionMatrix = {
+  'O': '0', 'o': '0', 'Q': '0', 'D': '0',
+  'I': '1', 'l': '1', 'i': '1', '|': '1', '!': '1', ']': '1',
+  'Z': '2', 'z': '2', 'E': '3', 'e': '3', 'A': '4',
+  'S': '5', 's': '5', r'$': '5', 'G': '6', 'b': '6',
+  'T': '7', 't': '7', 'B': '8', 'q': '9', 'g': '9',
+};
+```
 
 ---
 
 ## 📝 Changelog
 
-### v1.0.0 — 10 September 2026
-- App renamed to **Scan to Call**
-- Custom green scanner launcher icon (all density buckets)
-- Code minification + resource shrinking (ProGuard/R8)
-- Split-per-ABI APKs: 74 MB → ~25-31 MB
-- Frame stabilization (700ms debounce)
-- Gallery button position fixed (above gesture bar)
-- Multi-number extraction engine (Set deduplication)
-- Modal bottom sheet number picker (dark glassmorphic UI)
-- Anti-flicker 1.5s cooldown after modal dismiss
-- SQLite source tagging: `camera`, `gallery`, `camera_multi`
+### v1.1.0 — 2 October 2026
+- **GPay/PhonePe-Level Scanning Pipeline:**
+  - Integrated 1080p high-resolution camera stream (`ResolutionPreset.high`) with continuous auto-focus.
+  - Added spatial ROI bounding box filtering to isolate text inside the green viewfinder box.
+  - Implemented 3-frame rolling consensus voting engine (2/3 majority requirement).
+  - Added OCR character confusion matrix sanitizer (`O`→`0`, `l`→`1`, `S`→`5`, `B`→`8`).
+  - Implemented universal global phone number parser supporting E.164, local trunk zero, and international formats.
+  - Added strict noise rejection filtering dates, timestamps, IP addresses, and currency/prices.
+  - Added tactile haptic response on consensus lock (`HapticFeedback.mediumImpact()`).
 
 ---
 

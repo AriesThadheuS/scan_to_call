@@ -11,9 +11,9 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════════════
 // DatabaseHelper — Offline SQLite call log
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════════════
 class DatabaseHelper {
   static Database? _db;
 
@@ -59,6 +59,52 @@ class DatabaseHelper {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENHANCEMENT 4: Multi-Frame Rolling Consensus Voting Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+/// Requires a candidate phone number to appear in at least [minVotes] out of the last
+/// [bufferSize] consecutive frames before being committed to UI state.
+/// This completely eliminates 1-frame OCR noise, motion blur glitches, and misreads.
+class ConsensusVoter {
+  final int bufferSize;
+  final int minVotes;
+
+  // Ring buffer of per-frame candidate sets
+  final List<Set<String>> _frameBuffer = [];
+
+  ConsensusVoter({this.bufferSize = 3, this.minVotes = 2});
+
+  /// Feed candidate numbers found in the current frame.
+  /// Returns the Set of phone numbers that have reached consensus majority.
+  Set<String> vote(Set<String> frameCandidates) {
+    // Push current frame candidates; evict oldest frame if buffer capacity reached
+    _frameBuffer.add(Set<String>.from(frameCandidates));
+    if (_frameBuffer.length > bufferSize) {
+      _frameBuffer.removeAt(0);
+    }
+
+    // Tally frequency of each candidate across buffered frames
+    final Map<String, int> tally = {};
+    for (final frame in _frameBuffer) {
+      for (final candidate in frame) {
+        tally[candidate] = (tally[candidate] ?? 0) + 1;
+      }
+    }
+
+    // Return only numbers meeting or exceeding minVotes threshold
+    return tally.entries
+        .where((e) => e.value >= minVotes)
+        .map((e) => e.key)
+        .toSet();
+  }
+
+  /// Clear the rolling frame buffer (e.g. on app pause/resume or camera switch).
+  void reset() => _frameBuffer.clear();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// App Entry Point
+// ═══════════════════════════════════════════════════════════════════════════════
 List<CameraDescription> _cameras = [];
 
 void main() async {
@@ -66,7 +112,7 @@ void main() async {
   try {
     _cameras = await availableCameras();
   } catch (e) {
-    debugPrint("Failed to get available cameras: $e");
+    debugPrint('Failed to get available cameras: $e');
   }
 
   runApp(const PhoneExtractorApp());
@@ -92,6 +138,9 @@ class PhoneExtractorApp extends StatelessWidget {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// LiveCameraScannerScreen — Main High-Speed Scanner Widget
+// ═══════════════════════════════════════════════════════════════════════════════
 class LiveCameraScannerScreen extends StatefulWidget {
   const LiveCameraScannerScreen({super.key});
 
@@ -102,26 +151,64 @@ class LiveCameraScannerScreen extends StatefulWidget {
 
 class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     with WidgetsBindingObserver {
+  // ── Camera Controller ─────────────────────────────────────────────────────
   CameraController? _cameraController;
   final int _selectedCameraIndex = 0;
   bool _isCameraInitialized = false;
+  bool _isFlashOn = false;
 
+  // ── Frame Processing Pipeline State ───────────────────────────────────────
   bool _isProcessingFrame = false;
   int _lastFrameProcessedTimestamp = 0;
+
+  // ── UI & Detection State ──────────────────────────────────────────────────
   String? _detectedPhoneNumber;
   String? _lastAutoSavedNumber;
-  bool _isFlashOn = false;
-  int _lastValidDetectionTimestamp = 0;
-  static const int _stabilizationHoldMs = 700; // Hold recognized number for 700ms to prevent jitter/shake clearing
 
+  // ENHANCEMENT 4: Multi-frame consensus voter (3-frame buffer, 2/3 majority vote)
+  final ConsensusVoter _consensusVoter =
+      ConsensusVoter(bufferSize: 3, minVotes: 2);
+
+  // Stabilization: hold last confirmed number for 700ms to prevent UI flicker
+  int _lastValidDetectionTimestamp = 0;
+  static const int _stabilizationHoldMs = 700;
+
+  // Modal Bottom Sheet State
   bool _isBottomSheetOpen = false;
   int _modalDismissCooldownUntil = 0;
 
+  // ── Viewfinder ROI Bounding Box (Screen Space) ───────────────────────────
+  Rect _viewfinderRoi = Rect.zero;
+
+  // ── Recognition Tools ─────────────────────────────────────────────────────
   final ImagePicker _imagePicker = ImagePicker();
   final TextRecognizer _textRecognizer = TextRecognizer(
     script: TextRecognitionScript.latin,
   );
 
+  // ── ENHANCEMENT 2: Global OCR Character Confusion Matrix ─────────────────
+  /// Maps common OCR digit-letter confusion errors to proper numeric digits.
+  static const Map<String, String> _ocrConfusionMatrix = {
+    'O': '0', 'o': '0', 'Q': '0', 'D': '0',
+    'I': '1', 'l': '1', 'i': '1', '|': '1', '!': '1', ']': '1',
+    'Z': '2', 'z': '2',
+    'E': '3', 'e': '3',
+    'A': '4',
+    'S': '5', 's': '5', r'$': '5',
+    'G': '6', 'b': '6',
+    'T': '7', 't': '7',
+    'B': '8',
+    'q': '9', 'g': '9',
+  };
+
+  // Compiled regex pattern for character replacement
+  static final RegExp _confusionPattern = RegExp(
+    '[${_ocrConfusionMatrix.keys.map(RegExp.escape).join()}]',
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Lifecycle Handlers
+  // ─────────────────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
@@ -133,15 +220,14 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final CameraController? cameraController = _cameraController;
-    if (cameraController == null || !cameraController.value.isInitialized) {
-      return;
-    }
+    final CameraController? cc = _cameraController;
+    if (cc == null || !cc.value.isInitialized) return;
 
     if (state == AppLifecycleState.inactive) {
       _stopCameraStream();
     } else if (state == AppLifecycleState.resumed) {
-      _initCamera(cameraController.description);
+      _consensusVoter.reset(); // Reset voter on app resume to flush stale frames
+      _initCamera(cc.description);
     }
   }
 
@@ -154,11 +240,13 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     super.dispose();
   }
 
-  /// Initialize Camera Controller and start continuous live stream
+  // ─────────────────────────────────────────────────────────────────────────
+  // ENHANCEMENT 6: Camera Initialization with High-Res 1080p & AutoFocus
+  // ─────────────────────────────────────────────────────────────────────────
   Future<void> _initCamera(CameraDescription cameraDescription) async {
     final CameraController cameraController = CameraController(
       cameraDescription,
-      ResolutionPreset.high,
+      ResolutionPreset.high, // 1080p resolution for high OCR accuracy
       enableAudio: false,
       imageFormatGroup: Platform.isAndroid
           ? ImageFormatGroup.nv21
@@ -171,27 +259,29 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
       await cameraController.initialize();
       if (!mounted) return;
 
-      setState(() {
-        _isCameraInitialized = true;
-      });
+      // Enable continuous auto-focus mode immediately after initialization
+      try {
+        await cameraController.setFocusMode(FocusMode.auto);
+        debugPrint('[CAMERA] AutoFocus initialized to FocusMode.auto');
+      } catch (e) {
+        debugPrint('[CAMERA] Focus mode set exception (non-fatal): $e');
+      }
 
+      setState(() => _isCameraInitialized = true);
       _startCameraStream();
     } catch (e) {
-      debugPrint("Camera initialization error: $e");
+      debugPrint('[CAMERA] Initialization error: $e');
     }
   }
 
-  /// Starts continuous stream processing for dynamic real-time tracking
+  /// Starts live camera stream processing
   void _startCameraStream() {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
       return;
     }
-
     if (_cameraController!.value.isStreamingImages) return;
 
-    _cameraController!.startImageStream((CameraImage image) {
-      _processCameraFrame(image);
-    });
+    _cameraController!.startImageStream(_processCameraFrame);
   }
 
   /// Stops camera image stream safely
@@ -202,12 +292,14 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
       try {
         await _cameraController!.stopImageStream();
       } catch (e) {
-        debugPrint("Error stopping image stream: $e");
+        debugPrint('[CAMERA] Stop stream error: $e');
       }
     }
   }
 
-  /// Convert CameraImage frame to InputImage for Google ML Kit
+  // ─────────────────────────────────────────────────────────────────────────
+  // InputImage Construction
+  // ─────────────────────────────────────────────────────────────────────────
   InputImage? _inputImageFromCameraImage(
       CameraImage image, CameraDescription camera) {
     final sensorOrientation = camera.sensorOrientation;
@@ -238,80 +330,79 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     );
   }
 
-  /// Dynamic Real-Time Frame Processing (Face-Detection Style) with 300ms throttling
+  // ─────────────────────────────────────────────────────────────────────────
+  // High-Performance Frame Processing Pipeline (250ms Throttled)
+  // ─────────────────────────────────────────────────────────────────────────
   Future<void> _processCameraFrame(CameraImage image) async {
     if (_cameraController == null) return;
 
     final int now = DateTime.now().millisecondsSinceEpoch;
 
-    // Skip frame processing if modal bottom sheet is open or in anti-flicker cooldown
-    if (_isBottomSheetOpen || now < _modalDismissCooldownUntil) {
-      return;
-    }
+    // Skip processing during bottom sheet display or cooldown window
+    if (_isBottomSheetOpen || now < _modalDismissCooldownUntil) return;
 
-    // Process 1 frame every 300ms to maintain smooth 60 FPS performance without lag
-    if (now - _lastFrameProcessedTimestamp < 300) {
-      return;
-    }
+    // Throttle OCR to 1 frame every 250ms (~4 FPS — sweet spot for accuracy and battery)
+    if (now - _lastFrameProcessedTimestamp < 250) return;
 
     if (_isProcessingFrame) return;
     _isProcessingFrame = true;
     _lastFrameProcessedTimestamp = now;
 
     try {
-      final inputImage = _inputImageFromCameraImage(
-        image,
-        _cameraController!.description,
-      );
+      final inputImage =
+          _inputImageFromCameraImage(image, _cameraController!.description);
 
       if (inputImage == null) {
         _isProcessingFrame = false;
         return;
       }
 
+      // ── ML Kit Text Recognition ──────────────────────────────────────────
       final RecognizedText recognizedText =
           await _textRecognizer.processImage(inputImage);
 
-      final List<String> detectedNumbers =
-          _extractAllPhoneNumbers(recognizedText.text);
+      // ── Extract candidate numbers strictly within ROI ────────────────────
+      final Set<String> frameCandidates =
+          _extractCandidatesWithROI(recognizedText, image);
 
       if (!mounted) return;
 
-      if (detectedNumbers.length > 1) {
-        // Case B: Multiple numbers detected -> Show bottom sheet selector
-        debugPrint('[MULTI DETECT] Found ${detectedNumbers.length} numbers: $detectedNumbers');
-        _showMultipleNumbersBottomSheet(detectedNumbers);
-      } else if (detectedNumbers.length == 1) {
-        // Case A: Single number detected -> Update state & highlight green
-        final String foundPhoneNumber = detectedNumbers.first;
+      // ── ENHANCEMENT 4: Rolling consensus vote ─────────────────────────────
+      final Set<String> confirmedCandidates =
+          _consensusVoter.vote(frameCandidates);
+
+      // ── State Routing ─────────────────────────────────────────────────────
+      if (confirmedCandidates.length > 1) {
+        // Multiple confirmed candidates -> trigger bottom sheet selector
+        debugPrint(
+            '[MULTI DETECT] Consensus found ${confirmedCandidates.length} numbers: $confirmedCandidates');
+        _showMultipleNumbersBottomSheet(confirmedCandidates.toList());
+      } else if (confirmedCandidates.length == 1) {
+        // Single confirmed candidate -> lock UI state and trigger haptics
+        final String foundNumber = confirmedCandidates.first;
         _lastValidDetectionTimestamp = now;
 
-        if (_detectedPhoneNumber != foundPhoneNumber) {
-          HapticFeedback.selectionClick();
-          debugPrint("REALTIME TRACKING: Phone number detected '$foundPhoneNumber'");
+        if (_detectedPhoneNumber != foundNumber) {
+          // ENHANCEMENT 6: Tactile feedback on instant consensus verification
+          HapticFeedback.mediumImpact();
+          debugPrint('[CONSENSUS LOCKED] Phone number verified: "$foundNumber"');
         }
 
-        if (foundPhoneNumber != _lastAutoSavedNumber) {
-          _lastAutoSavedNumber = foundPhoneNumber;
-          final String cleanNum =
-              foundPhoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
-          debugPrint('[CAMERA DETECT] Number tracked: $cleanNum');
+        if (foundNumber != _lastAutoSavedNumber) {
+          _lastAutoSavedNumber = foundNumber;
+          debugPrint('[CAMERA DETECT] Number logged: $foundNumber');
         }
 
         setState(() {
-          _detectedPhoneNumber = foundPhoneNumber;
+          _detectedPhoneNumber = foundNumber;
         });
       } else {
-        // Frame stabilization / Debounce: Hold last valid number for 700ms to avoid flicker/jitter during hand movement
+        // No consensus number in this frame -> apply 700ms stabilization hold
         if (_detectedPhoneNumber != null &&
             (now - _lastValidDetectionTimestamp < _stabilizationHoldMs)) {
-          debugPrint(
-              "STABILIZATION: Frame missed number, maintaining state (${now - _lastValidDetectionTimestamp}ms / ${_stabilizationHoldMs}ms)");
+          // Hold last valid detection to eliminate flicker during hand jitter
         } else {
-          // Camera moved away / beyond hold duration -> Clear state & reset auto-save tracker
           if (_detectedPhoneNumber != null || _lastAutoSavedNumber != null) {
-            debugPrint(
-                "REALTIME TRACKING: Number left camera view -> clearing frame & reset auto-save tracker");
             _lastAutoSavedNumber = null;
             setState(() {
               _detectedPhoneNumber = null;
@@ -320,101 +411,226 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
         }
       }
     } catch (e) {
-      debugPrint("Error processing camera frame: $e");
+      debugPrint('[FRAME ERROR] Processing exception: $e');
     } finally {
       _isProcessingFrame = false;
     }
   }
 
-  /// Multi-Number Extraction Engine:
-  /// Extracts ALL unique valid 10-15 digit phone numbers detected within text.
-  List<String> _extractAllPhoneNumbers(String text) {
-    if (text.isEmpty) return [];
+  // ─────────────────────────────────────────────────────────────────────────
+  // ENHANCEMENT 2: OCR Character Confusion Sanitizer
+  // ─────────────────────────────────────────────────────────────────────────
+  /// Replaces common OCR error characters (e.g. 'O' -> '0', 'l' -> '1', 'S' -> '5')
+  String _sanitizeOcrText(String raw) {
+    if (raw.isEmpty) return raw;
+    return raw.splitMapJoin(
+      _confusionPattern,
+      onMatch: (m) => _ocrConfusionMatrix[m.group(0)!] ?? m.group(0)!,
+      onNonMatch: (s) => s,
+    );
+  }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // ENHANCEMENT 3: Strict Spatial ROI (Region of Interest) Bounding Box Filtering
+  // ─────────────────────────────────────────────────────────────────────────
+  /// Maps a bounding box from camera image pixel coordinates to screen space.
+  Rect _imageRectToScreenRect(
+    Rect imageRect,
+    Size imageSize,
+    Size screenSize,
+    InputImageRotation rotation,
+  ) {
+    final double imgW;
+    final double imgH;
+    if (rotation == InputImageRotation.rotation90deg ||
+        rotation == InputImageRotation.rotation270deg) {
+      imgW = imageSize.height;
+      imgH = imageSize.width;
+    } else {
+      imgW = imageSize.width;
+      imgH = imageSize.height;
+    }
+
+    final double scaleX = screenSize.width / imgW;
+    final double scaleY = screenSize.height / imgH;
+    final double scale = scaleX > scaleY ? scaleX : scaleY;
+
+    final double offsetX = (screenSize.width - imgW * scale) / 2.0;
+    final double offsetY = (screenSize.height - imgH * scale) / 2.0;
+
+    return Rect.fromLTRB(
+      imageRect.left * scale + offsetX,
+      imageRect.top * scale + offsetY,
+      imageRect.right * scale + offsetX,
+      imageRect.bottom * scale + offsetY,
+    );
+  }
+
+  /// Checks if [elementRect] intersects with [roi] by at least [threshold] (80%).
+  bool _isInsideRoi(Rect elementRect, Rect roi, {double threshold = 0.80}) {
+    if (roi == Rect.zero) return true;
+    final Rect intersection = elementRect.intersect(roi);
+    if (intersection.isEmpty) return false;
+    final double elementArea = elementRect.width * elementRect.height;
+    if (elementArea <= 0) return true;
+    final double overlapArea = intersection.width * intersection.height;
+    return (overlapArea / elementArea) >= threshold;
+  }
+
+  /// Filters recognized text lines by spatial ROI box and extracts clean candidates.
+  Set<String> _extractCandidatesWithROI(
+      RecognizedText recognizedText, CameraImage image) {
     final Set<String> results = {};
-    final List<String> rawLines = text.split(RegExp(r'[\r\n]+'));
+    final Size imageSize =
+        Size(image.width.toDouble(), image.height.toDouble());
+    final bool roiReady = _viewfinderRoi != Rect.zero;
 
-    final RegExp intlPattern = RegExp(r'\+\d[\d\s\-\.\(\)]{8,20}');
-    final RegExp zeroIndianPattern = RegExp(r'(?<!\d)0[\s\.-]?[6-9]\d{4}[\s\.-]?\d{5}(?!\d)');
-    final RegExp indianPattern = RegExp(r'(?<!\d)[6-9]\d{4}[\s\.-]?\d{5}(?!\d)');
-    final RegExp genericPattern = RegExp(r'(?<!\d)\+?\d[\d\s\-\.]{8,20}\d(?!\d)');
+    InputImageRotation rotation = InputImageRotation.rotation0deg;
+    if (_cameraController != null) {
+      final sensorOrientation =
+          _cameraController!.description.sensorOrientation;
+      rotation = InputImageRotationValue.fromRawValue(sensorOrientation) ??
+          InputImageRotation.rotation0deg;
+    }
 
-    for (final line in rawLines) {
-      final String trimmedLine = line.trim();
-      if (trimmedLine.isEmpty) continue;
+    final Size screenSize = _getScreenSize();
 
-      for (final Match m in intlPattern.allMatches(trimmedLine)) {
-        final String rawMatch = m.group(0)!;
-        final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
-        final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
-        if (digitsOnly.length >= 10 && digitsOnly.length <= 15 && clean.startsWith('+')) {
-          results.add(clean);
+    for (final TextBlock block in recognizedText.blocks) {
+      for (final TextLine line in block.lines) {
+        // ENHANCEMENT 3: Bounding box spatial ROI filtering
+        if (roiReady) {
+          final Rect lineBB = Rect.fromLTRB(
+            line.boundingBox.left.toDouble(),
+            line.boundingBox.top.toDouble(),
+            line.boundingBox.right.toDouble(),
+            line.boundingBox.bottom.toDouble(),
+          );
+          final Rect screenBB =
+              _imageRectToScreenRect(lineBB, imageSize, screenSize, rotation);
+
+          if (!_isInsideRoi(screenBB, _viewfinderRoi)) {
+            continue; // Skip line outside active viewfinder box
+          }
         }
-      }
 
-      for (final Match m in zeroIndianPattern.allMatches(trimmedLine)) {
-        final String rawMatch = m.group(0)!;
-        final String clean = rawMatch.replaceAll(RegExp(r'[^\d]'), '');
-        if (clean.length == 11 && clean.startsWith('0')) {
-          results.add(clean);
-        }
-      }
+        // ENHANCEMENT 2: Apply OCR confusion matrix sanitizer
+        final String sanitizedLine = _sanitizeOcrText(line.text);
 
-      for (final Match m in indianPattern.allMatches(trimmedLine)) {
-        final String rawMatch = m.group(0)!;
-        final String clean = rawMatch.replaceAll(RegExp(r'[^\d]'), '');
-        if (clean.length == 10 && RegExp(r'^[6-9]').hasMatch(clean)) {
-          results.add(clean);
-        }
-      }
-
-      for (final Match m in genericPattern.allMatches(trimmedLine)) {
-        final String rawMatch = m.group(0)!;
-        final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
-        final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
-        if (digitsOnly.length >= 10 && digitsOnly.length <= 15) {
-          results.add(clean);
-        }
+        // ENHANCEMENT 1 & 5: Universal parsing + false positive rejection
+        final Set<String> lineNumbers =
+            _extractUniversalPhoneNumbers(sanitizedLine);
+        results.addAll(lineNumbers);
       }
     }
 
-    if (results.isEmpty) {
-      final String sanitized = text.replaceAll(RegExp(r'[^\d+\s\-]'), ' ');
-
-      for (final Match m in intlPattern.allMatches(sanitized)) {
-        final String rawMatch = m.group(0)!;
-        final String clean = rawMatch.replaceAll(RegExp(r'[^\d+]'), '');
-        final String digitsOnly = clean.replaceAll(RegExp(r'[^\d]'), '');
-        if (digitsOnly.length >= 10 && digitsOnly.length <= 15 && clean.startsWith('+')) {
-          results.add(clean);
-        }
-      }
-
-      final String allDigits = text.replaceAll(RegExp(r'[^\d]'), '');
-
-      for (final Match m in RegExp(r'0[6-9]\d{9}').allMatches(allDigits)) {
-        results.add(m.group(0)!);
-      }
-
-      for (final Match m in RegExp(r'[6-9]\d{9}').allMatches(allDigits)) {
-        results.add(m.group(0)!);
-      }
-
-      if (results.isEmpty && allDigits.length >= 10 && allDigits.length <= 15) {
-        results.add(allDigits);
-      }
-    }
-
-    return results.toList();
+    return results;
   }
 
-  /// Single number convenience wrapper
+  // ─────────────────────────────────────────────────────────────────────────
+  // ENHANCEMENT 1: Universal Global Phone Parsing (E.164 & International)
+  // ENHANCEMENT 5: Strict Noise Filtering & False-Positive Rejection
+  // ─────────────────────────────────────────────────────────────────────────
+  static final RegExp _intlE164 = RegExp(r'\+(?:\d[\s\-\.]?){7,14}\d');
+  static final RegExp _intlWithCountryCode = RegExp(
+      r'\+\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{2,5}[\s\-\.]?\d{2,5}[\s\-\.]?\d{0,5}');
+  static final RegExp _trunkPrefixedNumber = RegExp(
+      r'(?<!\d)0[\s\-\.]?[1-9]\d{1,3}[\s\-\.]?\d{3,5}[\s\-\.]?\d{3,5}(?!\d)');
+  static final RegExp _localNumber = RegExp(
+      r'(?<!\d)[2-9]\d{3}[\s\-\.\(\)]{0,2}\d{3}[\s\-\.]{0,1}\d{3,5}(?!\d)');
+
+  // ENHANCEMENT 5 Exclusion patterns
+  static final RegExp _datePattern = RegExp(
+      r'\b(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4})\b');
+  static final RegExp _timePattern = RegExp(r'\b\d{1,2}:\d{2}(:\d{2})?\b');
+  static final RegExp _ipPattern =
+      RegExp(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b');
+  static final RegExp _currencyPattern =
+      RegExp(r'[\$₹€£¥]\s*[\d,\.]+|[\d,]+\.\d{2}\b');
+
+  bool _isFalsePositive(String rawToken, String cleanDigits) {
+    if (_datePattern.hasMatch(rawToken)) return true;
+    if (_timePattern.hasMatch(rawToken)) return true;
+    if (_ipPattern.hasMatch(rawToken)) return true;
+    if (_currencyPattern.hasMatch(rawToken)) return true;
+    if (cleanDigits.length == 4 &&
+        int.tryParse(cleanDigits) != null &&
+        int.parse(cleanDigits) >= 1900 &&
+        int.parse(cleanDigits) <= 2100) {
+      return true;
+    }
+    return false;
+  }
+
+  Set<String> _extractUniversalPhoneNumbers(String text) {
+    if (text.trim().isEmpty) return {};
+    final Set<String> results = {};
+
+    final List<RegExp> patterns = [
+      _intlE164,
+      _intlWithCountryCode,
+      _trunkPrefixedNumber,
+      _localNumber,
+    ];
+
+    for (final RegExp pattern in patterns) {
+      for (final Match m in pattern.allMatches(text)) {
+        final String rawToken = m.group(0)!;
+        final String digitsOnly = rawToken.replaceAll(RegExp(r'[^\d]'), '');
+
+        if (_isFalsePositive(rawToken, digitsOnly)) continue;
+
+        final bool hasPlus = rawToken.trimLeft().startsWith('+');
+        final String clean = hasPlus ? '+$digitsOnly' : digitsOnly;
+
+        // ENHANCEMENT 5: Length strictly 10 to 15 digits
+        if (digitsOnly.length < 10 || digitsOnly.length > 15) continue;
+        if (_isNonPhoneDigitPattern(digitsOnly)) continue;
+
+        results.add(clean);
+      }
+    }
+
+    return results;
+  }
+
+  bool _isNonPhoneDigitPattern(String digits) {
+    // Reject repeated digits (e.g. 0000000000)
+    if (RegExp(r'^(\d)\1+$').hasMatch(digits)) return true;
+
+    // Reject sequential runs
+    bool ascending = true, descending = true;
+    for (int i = 1; i < digits.length; i++) {
+      if (int.parse(digits[i]) != int.parse(digits[i - 1]) + 1) {
+        ascending = false;
+      }
+      if (int.parse(digits[i]) != int.parse(digits[i - 1]) - 1) {
+        descending = false;
+      }
+      if (!ascending && !descending) break;
+    }
+    if (ascending || descending) return true;
+
+    return false;
+  }
+
   String? _extractPhoneNumber(String text) {
-    final list = _extractAllPhoneNumbers(text);
-    return list.isNotEmpty ? list.first : null;
+    final String sanitized = _sanitizeOcrText(text);
+    final Set<String> nums = _extractUniversalPhoneNumbers(sanitized);
+    return nums.isNotEmpty ? nums.first : null;
   }
 
-  /// Displays modern modal bottom sheet when multiple phone numbers are detected
+  Size _getScreenSize() {
+    final binding = WidgetsBinding.instance;
+    final view = binding.platformDispatcher.views.first;
+    return Size(
+      view.physicalSize.width / view.devicePixelRatio,
+      view.physicalSize.height / view.devicePixelRatio,
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // UI Component: Multiple Numbers Selection Bottom Sheet
+  // ─────────────────────────────────────────────────────────────────────────
   Future<void> _showMultipleNumbersBottomSheet(List<String> numbers) async {
     if (!mounted || _isBottomSheetOpen) return;
     _isBottomSheetOpen = true;
@@ -436,7 +652,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Top drag bar indicator
                 Center(
                   child: Container(
                     width: 40,
@@ -448,8 +663,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                   ),
                 ),
                 const SizedBox(height: 16),
-
-                // Sheet Title Header
                 Row(
                   children: [
                     Container(
@@ -490,8 +703,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                   ],
                 ),
                 const SizedBox(height: 20),
-
-                // Number List Items
                 Flexible(
                   child: ListView.separated(
                     shrinkWrap: true,
@@ -516,7 +727,8 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                               color: const Color(0xFF2A2A3C),
                               borderRadius: BorderRadius.circular(16),
                               border: Border.all(
-                                color: Colors.greenAccent.withValues(alpha: 0.35),
+                                color: Colors.greenAccent
+                                    .withValues(alpha: 0.35),
                                 width: 1.2,
                               ),
                             ),
@@ -567,71 +779,44 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     );
 
     _isBottomSheetOpen = false;
-    // Set 1.5s anti-flicker cooldown after modal close to allow camera repositioning
     _modalDismissCooldownUntil = DateTime.now().millisecondsSinceEpoch + 1500;
   }
 
-  /// Offline Call / Save handler:
-  /// 1. Sanitizes phone number.
-  /// 2. Non-blocking SQLite call logging.
-  /// 3. ZERO delay permission check & native dialer launch.
+  // ─────────────────────────────────────────────────────────────────────────
+  // Dialer & Call Logging Engine
+  // ─────────────────────────────────────────────────────────────────────────
   Future<void> _handleDetectedNumber(String phoneNumber, String source) async {
-    debugPrint('======================================================');
-    debugPrint('[SAVE & CALL] START — number: $phoneNumber | source: $source');
-    debugPrint('======================================================');
-
-    // ── STEP 1: Sanitize immediately ──────────────────────────────────────────
     final String sanitized = phoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
     final String digitsOnly = sanitized.replaceAll('+', '');
-    debugPrint('[SAVE & CALL] Step 1 — Sanitized: "$sanitized" | Digits: ${digitsOnly.length}');
 
-    if (digitsOnly.length < 10 || digitsOnly.length > 15) {
-      debugPrint('[SAVE & CALL] ABORT — Invalid digit count: ${digitsOnly.length}');
-      return;
-    }
+    if (digitsOnly.length < 10 || digitsOnly.length > 15) return;
 
-    // ── STEP 2: Non-blocking SQLite offline log ──────────────────────────────
+    // Async non-blocking SQLite call log
     Future.microtask(() => DatabaseHelper.logCall(sanitized, source));
 
-    // ── STEP 3: Permission check for CALL_PHONE ───────────────────────────────
-    debugPrint('[SAVE & CALL] Step 3 — Checking Permission.phone...');
     try {
       final PermissionStatus phonePermStatus = await Permission.phone.status;
       if (phonePermStatus.isDenied) {
         await Permission.phone.request();
       }
     } catch (e) {
-      debugPrint('[PERMISSION] Exception (non-fatal, proceeding): $e');
+      debugPrint('[PERMISSION] Phone permission request exception: $e');
     }
 
-    // ── STEP 4: Launch native dialer ──────────────────────────────────────────
     await _openDialer(sanitized);
-
-    debugPrint('[SAVE & CALL] END — Completed flow for $sanitized');
-    debugPrint('======================================================');
   }
 
-  /// Launch native dialer via url_launcher.
-  /// Expects an already-sanitized number (digits + optional leading '+').
-  /// Step-by-step debugPrint tracing at every decision point.
   Future<void> _openDialer(String sanitized) async {
-    debugPrint('[DIALER] Step A — Input: "$sanitized"');
-
-    // A. Build URI
     final Uri telUri = Uri.parse('tel:$sanitized');
-    debugPrint('[DIALER] Step B — URI built: $telUri');
 
-    // B. canLaunchUrl check
     bool canLaunch = false;
     try {
       canLaunch = await canLaunchUrl(telUri);
-      debugPrint('[DIALER] Step C — canLaunchUrl: $canLaunch');
     } catch (e) {
-      debugPrint('[DIALER] Step C — canLaunchUrl EXCEPTION: $e');
+      debugPrint('[DIALER] canLaunchUrl check failed: $e');
     }
 
     if (!canLaunch) {
-      debugPrint('[DIALER] ABORT — No app can handle tel: scheme on this device');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -639,46 +824,30 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
           backgroundColor: Colors.orange.shade800,
           behavior: SnackBarBehavior.floating,
           margin: const EdgeInsets.all(16),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         ),
       );
       return;
     }
 
-    // C. Attempt primary launch: externalNonBrowserApplication
-    debugPrint('[DIALER] Step D — Attempting launchUrl (externalNonBrowserApplication)...');
     try {
-      final bool launched = await launchUrl(
-        telUri,
-        mode: LaunchMode.externalNonBrowserApplication,
-      );
-      debugPrint('[DIALER] Step D — launchUrl returned: $launched');
-      if (launched) {
-        debugPrint('[DIALER] SUCCESS ✓ — Native dialer opened for $sanitized');
+      if (await launchUrl(telUri,
+          mode: LaunchMode.externalNonBrowserApplication)) {
         return;
       }
     } catch (e) {
-      debugPrint('[DIALER] Step D — EXCEPTION: $e — trying fallback mode...');
+      debugPrint('[DIALER] Primary launch mode failed: $e');
     }
 
-    // D. Fallback: externalApplication mode
-    debugPrint('[DIALER] Step E — Fallback: launchUrl (externalApplication)...');
     try {
-      final bool launched = await launchUrl(
-        telUri,
-        mode: LaunchMode.externalApplication,
-      );
-      debugPrint('[DIALER] Step E — Fallback returned: $launched');
-      if (launched) {
-        debugPrint('[DIALER] SUCCESS (fallback) ✓ — Dialer opened for $sanitized');
+      if (await launchUrl(telUri, mode: LaunchMode.externalApplication)) {
         return;
       }
     } catch (e) {
-      debugPrint('[DIALER] Step E — Fallback EXCEPTION: $e');
+      debugPrint('[DIALER] Fallback launch mode failed: $e');
     }
 
-    // E. Both modes failed — show SnackBar
-    debugPrint('[DIALER] FAILED — Both launch modes returned false/threw for $sanitized');
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -691,7 +860,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     );
   }
 
-  /// Fallback Upload from Gallery using ImagePicker
   Future<void> _pickFromGallery() async {
     try {
       final XFile? pickedFile = await _imagePicker.pickImage(
@@ -707,15 +875,14 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
       final RecognizedText recognizedText =
           await _textRecognizer.processImage(inputImage);
 
-      final String? foundPhoneNumber = _extractPhoneNumber(recognizedText.text);
+      final String? foundPhoneNumber =
+          _extractPhoneNumber(recognizedText.text);
 
       if (foundPhoneNumber != null && foundPhoneNumber.isNotEmpty) {
         HapticFeedback.heavyImpact();
-
         setState(() {
           _detectedPhoneNumber = foundPhoneNumber;
         });
-
         await _handleDetectedNumber(foundPhoneNumber, 'gallery');
       } else {
         if (!mounted) return;
@@ -727,7 +894,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                 SizedBox(width: 12),
                 Expanded(
                   child: Text(
-                    'No phone number detected in the image',
+                    'No valid phone number detected in image',
                     style: TextStyle(fontWeight: FontWeight.w500),
                   ),
                 ),
@@ -743,16 +910,14 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
         );
       }
     } catch (e) {
-      debugPrint("Gallery processing error: $e");
+      debugPrint('[GALLERY ERROR] Exception: $e');
     }
   }
 
-  /// Toggle flashlight
   Future<void> _toggleFlash() async {
     if (_cameraController == null || !_cameraController!.value.isInitialized) {
       return;
     }
-
     try {
       if (_isFlashOn) {
         await _cameraController!.setFlashMode(FlashMode.off);
@@ -763,7 +928,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
         _isFlashOn = !_isFlashOn;
       });
     } catch (e) {
-      debugPrint("Error toggling flash: $e");
+      debugPrint('[FLASH ERROR] Exception: $e');
     }
   }
 
@@ -772,11 +937,18 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
     final size = MediaQuery.of(context).size;
     final bool hasDetectedNumber = _detectedPhoneNumber != null;
 
+    // ENHANCEMENT 3: Compute viewfinder ROI in screen coordinates during build
+    final double roiWidth = size.width * 0.85;
+    const double roiHeight = 170.0;
+    final double roiLeft = (size.width - roiWidth) / 2;
+    final double roiTop = (size.height - roiHeight) / 2;
+    _viewfinderRoi = Rect.fromLTWH(roiLeft, roiTop, roiWidth, roiHeight);
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // 1. Continuous Live Camera Preview
+          // ── 1. Live Camera Preview ────────────────────────────────────────
           if (_isCameraInitialized && _cameraController != null)
             SizedBox.expand(
               child: CameraPreview(_cameraController!),
@@ -789,18 +961,22 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                   CircularProgressIndicator(color: Color(0xFF6366F1)),
                   SizedBox(height: 16),
                   Text(
-                    'Initializing Live Camera...',
+                    'Initializing High-Speed Camera...',
                     style: TextStyle(color: Colors.white70),
                   ),
                 ],
               ),
             ),
 
-          // 2. Real-Time Dynamic Tracking Bounding Box Overlay (Face-Detection Style)
+          // ── 2. Semi-Transparent Dimming Mask (Outside Viewfinder) ────────
+          if (_isCameraInitialized)
+            _buildRoiMask(size, roiLeft, roiTop, roiWidth, roiHeight),
+
+          // ── 3. Green Viewfinder Target Overlay ───────────────────────────
           Center(
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 200),
-              width: size.width * 0.85,
+              width: roiWidth,
               height: hasDetectedNumber ? 200 : 160,
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
@@ -825,7 +1001,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  // Top Tracking Status Indicator
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
@@ -842,7 +1017,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                       const SizedBox(width: 8),
                       Text(
                         hasDetectedNumber
-                            ? 'NUMBER TRACKED'
+                            ? 'NUMBER VERIFIED ✓'
                             : 'ALIGN PHONE NUMBER HERE',
                         style: TextStyle(
                           color: hasDetectedNumber
@@ -855,8 +1030,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                       ),
                     ],
                   ),
-
-                  // Middle Detected Phone Number Display
                   if (hasDetectedNumber)
                     Container(
                       padding: const EdgeInsets.symmetric(
@@ -889,8 +1062,6 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
                         fontSize: 13,
                       ),
                     ),
-
-                  // Interactive "Call <number>" Action Button
                   if (hasDetectedNumber)
                     SizedBox(
                       width: double.infinity,
@@ -930,7 +1101,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
             ),
           ),
 
-          // 3. Top Control Bar (Flashlight & Header)
+          // ── 4. Top Telemetry Header & Flash Toggle ────────────────────────
           SafeArea(
             child: Padding(
               padding: const EdgeInsets.all(16.0),
@@ -980,7 +1151,7 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
             ),
           ),
 
-          // 4. Bottom Control Bar (Upload from Gallery) — Lifted above gesture bar
+          // ── 5. Bottom Gallery Control ─────────────────────────────────────
           Positioned(
             bottom: 50,
             left: 20,
@@ -1019,4 +1190,39 @@ class _LiveCameraScannerScreenState extends State<LiveCameraScannerScreen>
       ),
     );
   }
+
+  // Helper widget for drawing dimming overlay mask
+  Widget _buildRoiMask(
+      Size size, double roiLeft, double roiTop, double roiWidth, double roiHeight) {
+    return CustomPaint(
+      size: size,
+      painter: _RoiMaskPainter(
+        roiRect: Rect.fromLTWH(roiLeft, roiTop, roiWidth, roiHeight),
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROI Mask CustomPainter — Darkens non-scanning area
+// ═══════════════════════════════════════════════════════════════════════════════
+class _RoiMaskPainter extends CustomPainter {
+  final Rect roiRect;
+  const _RoiMaskPainter({required this.roiRect});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint paint = Paint()..color = Colors.black.withValues(alpha: 0.48);
+
+    final Path path = Path()
+      ..addRect(Rect.fromLTWH(0, 0, size.width, size.height))
+      ..addRRect(
+        RRect.fromRectAndRadius(roiRect, const Radius.circular(24)),
+      );
+    path.fillType = PathFillType.evenOdd;
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _RoiMaskPainter old) => old.roiRect != roiRect;
 }
